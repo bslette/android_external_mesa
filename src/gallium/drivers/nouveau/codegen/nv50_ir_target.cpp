@@ -157,6 +157,7 @@ Target *Target::create(unsigned int chipset)
    case 0x170:
    case 0x160:
    case 0x140:
+   case 0x150: /* GV11B (Xavier) */
       return getTargetGV100(chipset);
    case 0x110:
    case 0x120:

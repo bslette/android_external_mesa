@@ -960,6 +960,7 @@ GCRA::coalesce(ArrayList& insns)
    case 0x120:
    case 0x130:
    case 0x140:
+   case 0x150: /* GV11B (Xavier) */
    case 0x160:
    case 0x170:
    case 0x190:
@@ -2311,6 +2312,7 @@ RegAlloc::InsertConstraintsPass::visit(BasicBlock *bb)
          case 0x120:
          case 0x130:
          case 0x140:
+         case 0x150: /* GV11B (Xavier) */
          case 0x160:
          case 0x170:
          case 0x190:

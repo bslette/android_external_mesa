@@ -51,6 +51,7 @@ nouveau_screen_create(int fd, const struct pipe_screen_config *config,
    case 0x120:
    case 0x130:
    case 0x140:
+   case 0x150: /* GV11B (Xavier) */
    case 0x160:
    case 0x170:
    case 0x190:
