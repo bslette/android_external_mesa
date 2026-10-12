@@ -46,6 +46,71 @@
 #include "tegra_resource.h"
 #include "tegra_screen.h"
 
+/*
+ * NVIDIA block-linear modifiers name page kind 0 and 0xfe for the same
+ * layout (see drm_fourcc.h: kind 0 "is remapped within drivers to 0xfe").
+ * Nouveau spells them with 0xfe; Tegra DRM only accepts the legacy kind-0
+ * DRM_FORMAT_MOD_NVIDIA_16BX2_BLOCK() forms (+ sector layout bit). Translate
+ * at the boundary: GPU spelling inside, display spelling outside.
+ */
+#define TEGRA_MOD_KIND_MASK (0xffull << 12)
+#define TEGRA_MOD_GEN_MASK  (0x3ull << 20)
+#define TEGRA_MOD_COMP_MASK (0x7ull << 23)
+
+static bool
+tegra_mod_is_block_linear(uint64_t modifier)
+{
+   return fourcc_mod_is_vendor(modifier, NVIDIA) && (modifier & 0x10);
+}
+
+static uint64_t
+tegra_mod_to_display(uint64_t modifier)
+{
+   if (tegra_mod_is_block_linear(modifier) &&
+       (modifier & TEGRA_MOD_KIND_MASK) == (0xfeull << 12) &&
+       !(modifier & (TEGRA_MOD_GEN_MASK | TEGRA_MOD_COMP_MASK)))
+      return modifier & ~TEGRA_MOD_KIND_MASK;
+
+   return modifier;
+}
+
+static uint64_t
+tegra_mod_to_gpu(uint64_t modifier)
+{
+   if (tegra_mod_is_block_linear(modifier) &&
+       !(modifier & TEGRA_MOD_KIND_MASK))
+      return modifier | (0xfeull << 12);
+
+   return modifier;
+}
+
+/* Block-linear modifiers the display can take, in the GPU's spelling. */
+static int
+tegra_screen_scanout_modifiers(struct tegra_screen *screen,
+                               enum pipe_format format,
+                               uint64_t *modifiers, int max)
+{
+   uint64_t all[32];
+   int count = 0, num = 0, i;
+
+   if (!screen->gpu->query_dmabuf_modifiers)
+      return 0;
+
+   screen->gpu->query_dmabuf_modifiers(screen->gpu, format, ARRAY_SIZE(all),
+                                       all, NULL, &count);
+
+   for (i = 0; i < count && num < max; i++) {
+      if (!tegra_mod_is_block_linear(all[i]))
+         continue;
+      /* only layouts that have a legacy (kind 0, gen 0) display spelling */
+      if (tegra_mod_to_display(all[i]) == all[i])
+         continue;
+      modifiers[num++] = all[i];
+   }
+
+   return num;
+}
+
 static void tegra_screen_destroy(struct pipe_screen *pscreen)
 {
    struct tegra_screen *screen = to_tegra_screen(pscreen);
@@ -139,7 +204,9 @@ static int tegra_screen_import_resource(struct tegra_screen *screen,
    handle.modifier = DRM_FORMAT_MOD_INVALID;
    handle.type = WINSYS_HANDLE_TYPE_FD;
 
-   status = screen->gpu->resource_get_handle(screen->gpu, NULL, resource->gpu,
+   status = screen->gpu->resource_get_handle(screen->gpu, NULL,
+                                             resource->scanout ? resource->scanout
+                                                               : resource->gpu,
                                              &handle, 0);
    if (!status)
       return -EINVAL;
@@ -151,7 +218,7 @@ static int tegra_screen_import_resource(struct tegra_screen *screen,
       return -EINVAL;
    }
 
-   resource->modifier = handle.modifier;
+   resource->modifier = tegra_mod_to_display(handle.modifier);
    resource->stride = handle.stride;
    fd = handle.handle;
 
@@ -191,9 +258,43 @@ tegra_screen_resource_create(struct pipe_screen *pscreen,
    if (template->bind & PIPE_BIND_SCANOUT)
       modifier = DRM_FORMAT_MOD_LINEAR;
 
-   resource->gpu = screen->gpu->resource_create_with_modifiers(screen->gpu,
-                                                               template,
-                                                               &modifier, 1);
+   /*
+    * nvc0 cannot combine a pitch-linear color buffer with a depth buffer and
+    * silently disables depth testing, so rendering straight into the linear
+    * scanout buffer broke every on-screen 3D app. Tegra DRM only takes the
+    * buffer tiling from framebuffer modifiers, which these applications don't
+    * pass, so the display needs pitch-linear. Render into a block-linear
+    * resource and copy it to a linear scanout shadow in flush_resource.
+    */
+   if (template->bind & PIPE_BIND_SCANOUT && !(template->bind & PIPE_BIND_LINEAR) &&
+       template->target == PIPE_TEXTURE_2D && template->last_level == 0 &&
+       template->nr_samples <= 1) {
+      uint64_t mods[16], linear = DRM_FORMAT_MOD_LINEAR;
+      struct pipe_resource tmpl = *template;
+
+      if (tegra_screen_scanout_modifiers(screen, template->format, mods,
+                                         ARRAY_SIZE(mods)) > 0) {
+         tmpl.bind &= ~PIPE_BIND_SCANOUT;
+         resource->gpu = screen->gpu->resource_create(screen->gpu, &tmpl);
+         if (resource->gpu)
+            resource->scanout =
+               screen->gpu->resource_create_with_modifiers(screen->gpu, template,
+                                                           &linear, 1);
+         if (!resource->scanout && resource->gpu) {
+            screen->gpu->resource_destroy(screen->gpu, resource->gpu);
+            resource->gpu = NULL;
+         }
+      }
+   }
+
+   if (resource->gpu)
+      ; /* tiled render target + linear scanout created above */
+   else if (modifier == DRM_FORMAT_MOD_INVALID)
+      resource->gpu = screen->gpu->resource_create(screen->gpu, template);
+   else
+      resource->gpu = screen->gpu->resource_create_with_modifiers(screen->gpu,
+                                                                  template,
+                                                                  &modifier, 1);
    if (!resource->gpu)
       goto free;
 
@@ -207,6 +308,8 @@ tegra_screen_resource_create(struct pipe_screen *pscreen,
    memcpy(&resource->base, resource->gpu, sizeof(*resource->gpu));
    pipe_reference_init(&resource->base.reference, 1);
    resource->base.screen = &screen->base;
+   /* the tiled render target was created without SCANOUT; keep the caller's */
+   resource->base.bind = template->bind;
 
    /* use private reference count for wrapped resources */
    resource->gpu->reference.count += 100000000;
@@ -251,8 +354,11 @@ tegra_screen_resource_from_handle(struct pipe_screen *pscreen,
    if (!resource)
       return NULL;
 
+   struct winsys_handle gpu_handle = *handle;
+
+   gpu_handle.modifier = tegra_mod_to_gpu(handle->modifier);
    resource->gpu = screen->gpu->resource_from_handle(screen->gpu, template,
-                                                     handle, usage);
+                                                     &gpu_handle, usage);
    if (!resource->gpu) {
       free(resource);
       return NULL;
@@ -308,6 +414,8 @@ tegra_screen_resource_get_handle(struct pipe_screen *pscreen,
       ret = screen->gpu->resource_get_handle(screen->gpu,
                                              context ? context->gpu : NULL,
                                              resource->gpu, handle, usage);
+      if (ret)
+         handle->modifier = tegra_mod_to_display(handle->modifier);
    }
 
    return ret;
@@ -322,6 +430,7 @@ tegra_screen_resource_destroy(struct pipe_screen *pscreen,
    /* adjust private reference count */
    p_atomic_add(&resource->gpu->reference.count, -resource->refcount);
    pipe_resource_reference(&resource->gpu, NULL);
+   pipe_resource_reference(&resource->scanout, NULL);
    free(resource);
 }
 
@@ -440,10 +549,17 @@ tegra_screen_resource_create_with_modifiers(struct pipe_screen *pscreen,
     */
    tmpl.bind |= PIPE_BIND_SCANOUT;
 
+   uint64_t *gpu_mods = malloc(sizeof(*gpu_mods) * MAX2(count, 1));
+   if (!gpu_mods)
+      goto free;
+   for (int i = 0; i < count; i++)
+      gpu_mods[i] = tegra_mod_to_gpu(modifiers[i]);
+
    resource->gpu = screen->gpu->resource_create_with_modifiers(screen->gpu,
                                                                &tmpl,
-                                                               modifiers,
+                                                               gpu_mods,
                                                                count);
+   free(gpu_mods);
    if (!resource->gpu)
       goto free;
 
@@ -474,6 +590,10 @@ static void tegra_screen_query_dmabuf_modifiers(struct pipe_screen *pscreen,
 
    screen->gpu->query_dmabuf_modifiers(screen->gpu, format, max, modifiers,
                                        external_only, count);
+
+   if (modifiers)
+      for (int i = 0; i < *count && i < max; i++)
+         modifiers[i] = tegra_mod_to_display(modifiers[i]);
 }
 
 static bool
@@ -484,7 +604,8 @@ tegra_screen_is_dmabuf_modifier_supported(struct pipe_screen *pscreen,
 {
    struct tegra_screen *screen = to_tegra_screen(pscreen);
 
-   return screen->gpu->is_dmabuf_modifier_supported(screen->gpu, modifier,
+   return screen->gpu->is_dmabuf_modifier_supported(screen->gpu,
+                                                    tegra_mod_to_gpu(modifier),
                                                     format, external_only);
 }
 
@@ -496,7 +617,9 @@ tegra_screen_get_dmabuf_modifier_planes(struct pipe_screen *pscreen,
    struct tegra_screen *screen = to_tegra_screen(pscreen);
 
    return screen->gpu->get_dmabuf_modifier_planes ?
-      screen->gpu->get_dmabuf_modifier_planes(screen->gpu, modifier, format) :
+      screen->gpu->get_dmabuf_modifier_planes(screen->gpu,
+                                              tegra_mod_to_gpu(modifier),
+                                              format) :
       util_format_get_num_planes(format);
 }
 
