@@ -33,6 +33,13 @@ struct tegra_resource {
    struct pipe_resource *gpu;
    unsigned int refcount;
 
+   /*
+    * Pitch-linear copy handed to the display when the GPU resource is
+    * block-linear (scanout requested without modifiers); refreshed from
+    * gpu in flush_resource before presentation.
+    */
+   struct pipe_resource *scanout;
+
    uint64_t modifier;
    uint32_t stride;
    uint32_t handle;

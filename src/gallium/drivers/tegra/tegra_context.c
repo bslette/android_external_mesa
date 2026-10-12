@@ -23,6 +23,7 @@
 
 #include <inttypes.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "util/u_debug.h"
 #include "util/u_draw.h"
@@ -496,6 +497,23 @@ tegra_set_framebuffer_state(struct pipe_context *pcontext,
                             const struct pipe_framebuffer_state *fb)
 {
    struct tegra_context *context = to_tegra_context(pcontext);
+   struct pipe_framebuffer_state state;
+   unsigned i;
+
+   /*
+    * Surfaces are embedded by value since the framebuffer-state rework, so
+    * their textures are still tegra wrappers: hand the GPU driver its own
+    * resources (nvc0 otherwise reads a tegra_resource as nv04_resource and
+    * crashes in nvc0_validate_fb).
+    */
+   if (fb) {
+      state = *fb;
+      for (i = 0; i < PIPE_MAX_COLOR_BUFS; i++)
+         state.cbufs[i].texture = tegra_resource_unwrap(fb->cbufs[i].texture);
+      state.zsbuf.texture = tegra_resource_unwrap(fb->zsbuf.texture);
+      state.resolve = tegra_resource_unwrap(fb->resolve);
+      fb = &state;
+   }
 
    context->gpu->set_framebuffer_state(context->gpu, fb);
 }
@@ -1061,6 +1079,26 @@ tegra_flush_resource(struct pipe_context *pcontext,
 {
    struct tegra_resource *resource = to_tegra_resource(presource);
    struct tegra_context *context = to_tegra_context(pcontext);
+
+   if (resource->scanout) {
+      struct pipe_blit_info blit;
+
+      memset(&blit, 0, sizeof(blit));
+      blit.src.resource = resource->gpu;
+      blit.src.format = resource->gpu->format;
+      blit.src.box.width = resource->gpu->width0;
+      blit.src.box.height = resource->gpu->height0;
+      blit.src.box.depth = 1;
+      blit.dst.resource = resource->scanout;
+      blit.dst.format = resource->scanout->format;
+      blit.dst.box = blit.src.box;
+      blit.mask = PIPE_MASK_RGBA;
+      blit.filter = PIPE_TEX_FILTER_NEAREST;
+
+      context->gpu->blit(context->gpu, &blit);
+      context->gpu->flush_resource(context->gpu, resource->scanout);
+      return;
+   }
 
    context->gpu->flush_resource(context->gpu, resource->gpu);
 }
