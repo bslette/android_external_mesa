@@ -739,7 +739,7 @@ tegra_clear(struct pipe_context *pcontext, unsigned buffers,
 {
    struct tegra_context *context = to_tegra_context(pcontext);
 
-   context->gpu->clear(context->gpu, buffers, color_clear_mask, stencil_clear_mask, NULL, color, depth, stencil);
+   context->gpu->clear(context->gpu, buffers, color_clear_mask, stencil_clear_mask, scissor_state, color, depth, stencil);
 }
 
 static void
