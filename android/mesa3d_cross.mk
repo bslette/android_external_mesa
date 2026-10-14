@@ -59,6 +59,17 @@ M_TARGET_PREFIX := $(my_2nd_arch_prefix)
 
 MESA3D_LIB_DIR := lib$(subst 32,,$(LOCAL_MULTILIB))
 
+# Rust-based drivers (NVK). Needs bindgen (built in-tree) and cbindgen (on PATH).
+MESA3D_USE_RUST := $(if $(filter nouveau,$(BOARD_MESA3D_VULKAN_DRIVERS)),true)
+MESA3D_RUST_VERSION ?= 1.93.1
+MESA3D_RUST_BIN := $(AOSP_ABSOLUTE_PATH)/prebuilts/rust-toolchain/linux-x86/$(MESA3D_RUST_VERSION)/bin
+MESA3D_RUST_TARGET := $(if $(filter arm64,$(TARGET_$(my_2nd_arch_prefix)ARCH)),aarch64-linux-android,armv7-linux-androideabi)
+MESA3D_CLANG_DIR := $(AOSP_ABSOLUTE_PATH)/$(LLVM_PREBUILTS_BASE)/linux-x86/$(LLVM_PREBUILTS_VERSION)
+MESA3D_CLANG_RESOURCE_DIR := $(firstword $(wildcard $(MESA3D_CLANG_DIR)/lib/clang/*))
+MESA3D_BINDGEN := $(call relative-to-absolute,$(HOST_OUT_EXECUTABLES)/bindgen)
+MESA3D_RUST_PATH := $(if $(MESA3D_USE_RUST),$(MESA3D_RUST_BIN):)
+MESA3D_RUST_ENV := $(if $(MESA3D_USE_RUST),LIBCLANG_PATH=$(MESA3D_CLANG_DIR)/lib)
+
 MESON_OUT_DIR                            := $($(M_TARGET_PREFIX)TARGET_OUT_INTERMEDIATES)/MESON_MESA3D
 MESON_GEN_DIR                            := $(MESON_OUT_DIR)_GEN
 MESON_GEN_FILES_TARGET                   := $(MESON_GEN_DIR)/.timestamp
@@ -83,7 +94,7 @@ MESA3D_GLES_BINS := \
     $($(M_TARGET_PREFIX)MESA3D_LIBGLESV2_BIN) \
 
 MESON_GEN_NINJA := \
-	cd $(MESON_OUT_DIR) && PATH=$(AOSP_ABSOLUTE_PATH)/prebuilts/mesa-build-dep/bin:/usr/bin:/usr/local/bin:$$PATH meson ./build \
+	cd $(MESON_OUT_DIR) && PATH=$(MESA3D_RUST_PATH)$(AOSP_ABSOLUTE_PATH)/prebuilts/mesa-build-dep/bin:/usr/bin:/usr/local/bin:$$PATH $(MESA3D_RUST_ENV) meson ./build \
 	--cross-file $(call relative-to-absolute,$(MESON_GEN_DIR))/aosp_cross        \
 	--buildtype=release                                                          \
 	-Dplatforms=android                                                          \
@@ -101,9 +112,12 @@ MESON_GEN_NINJA := \
 	-Dandroid-libbacktrace=disabled                                              \
 	$(BOARD_MESA3D_MESON_ARGS)                                                   \
 
-MESON_BUILD := PATH=$(AOSP_ABSOLUTE_PATH)/prebuilts/mesa-build-dep/bin:/usr/bin:/bin:/sbin:$$PATH ninja -C $(MESON_OUT_DIR)/build
+MESON_BUILD := PATH=$(MESA3D_RUST_PATH)$(AOSP_ABSOLUTE_PATH)/prebuilts/mesa-build-dep/bin:/usr/bin:/bin:/sbin:/usr/local/bin:$$PATH $(MESA3D_RUST_ENV) ninja -C $(MESON_OUT_DIR)/build
 
 $(MESON_GEN_FILES_TARGET): MESON_CPU_FAMILY := $(subst arm64,aarch64,$(TARGET_$(M_TARGET_PREFIX)ARCH))
+$(MESON_GEN_FILES_TARGET): PRIVATE_USE_RUST := $(MESA3D_USE_RUST)
+$(MESON_GEN_FILES_TARGET): PRIVATE_RUST_TARGET := $(MESA3D_RUST_TARGET)
+$(MESON_GEN_FILES_TARGET): $(if $(MESA3D_USE_RUST),$(HOST_OUT_EXECUTABLES)/bindgen)
 
 define create-pkgconfig
 echo -e "Name: $2" \
@@ -218,6 +232,14 @@ define filter-c-flags
     $(patsubst  -W%,, $1))
 endef
 
+define bindgen-clang-args
+  -nostdlibinc \
+  $(filter -D%,$(call filter-c-flags,$(m-c-flags))) \
+  $(foreach inc,$(nospace-includes),$(call abs-include,$(inc))) \
+  --target=$(PRIVATE_RUST_TARGET) \
+  -resource-dir=$(MESA3D_CLANG_RESOURCE_DIR)
+endef
+
 define nospace-includes
   $(subst $(space)-isystem$(space),$(space)-isystem, \
   $(subst $(space)-I$(space),$(space)-I, \
@@ -246,15 +268,20 @@ $(MESON_GEN_FILES_TARGET): PREPROCESS_MESON_CONFIGS:=$(PREPROCESS_MESON_CONFIGS)
 $(MESON_GEN_FILES_TARGET): MESON_GEN_DIR:=$(MESON_GEN_DIR)
 $(MESON_GEN_FILES_TARGET): $(sort $(shell find -L $(MESA3D_TOP) -not -path '*/\.*'))
 	mkdir -p $(dir $@)
+	$(if $(PRIVATE_USE_RUST),mkdir -p $(dir $@)/libcxx && ln -sf $(call relative-to-absolute,$(firstword $(filter %/libc++.vendor.so %/libc++.so,$(PRIVATE_ALL_SHARED_LIBRARIES)))) $(dir $@)/libcxx/libc++.so)
 	echo -e "[properties]\n"                                                                                                  \
+		$(if $(PRIVATE_USE_RUST),"skip_sanity_check = true\n"                                                            \
+		"bindgen_clang_arguments = [$(foreach a,$(bindgen-clang-args),'$(a)'$(comma) )'']\n")                                  \
 		"c_args = [$(foreach flag,$(call filter-c-flags,$(m-c-flags)),'$(flag)', ) \
                            $(foreach inc,$(nospace-includes),'$(call abs-include,$(inc))', )'']\n" \
 		"cpp_args = [$(foreach flag,$(call filter-c-flags,$(m-cpp-flags)),'$(flag)', ) \
                              $(foreach inc,$(nospace-includes),'$(call abs-include,$(inc))', )'']\n" \
-		"c_link_args = [$(foreach flag, $(m-lld-flags-cleaned),'$(flag)',)'']\n"                                          \
-		"cpp_link_args = [$(foreach flag, $(m-lld-flags-cleaned),'$(flag)',)'']\n"                                        \
+		"c_link_args = [$(if $(PRIVATE_USE_RUST),'-L$(call relative-to-absolute,$(dir $@))libcxx'$(comma))$(foreach flag, $(m-lld-flags-cleaned),'$(flag)',)'']\n" \
+		"cpp_link_args = [$(if $(PRIVATE_USE_RUST),'-L$(call relative-to-absolute,$(dir $@))libcxx'$(comma))$(foreach flag, $(m-lld-flags-cleaned),'$(flag)',)'']\n" \
 		"needs_exe_wrapper = true\n"                                                                                      \
 		"[binaries]\n"                                                                                                    \
+		$(if $(PRIVATE_USE_RUST),"rust = ['$(MESA3D_RUST_BIN)/rustc'$(comma) '--target'$(comma) '$(PRIVATE_RUST_TARGET)'$(comma) '-C'$(comma) 'panic=abort']\n" \
+		"bindgen = '$(MESA3D_BINDGEN)'\n")                                                                              \
 		"ar = '$(AOSP_ABSOLUTE_PATH)/$($($(M_TARGET_PREFIX))TARGET_AR)'\n"                                                \
 		"c = [$(foreach arg,$(PRIVATE_CC),'$(subst prebuilts/,$(AOSP_ABSOLUTE_PATH)/prebuilts/,$(arg))',)'']\n"           \
 		"cpp = [$(foreach arg,$(PRIVATE_CXX),'$(subst prebuilts/,$(AOSP_ABSOLUTE_PATH)/prebuilts/,$(arg))',)'']\n"        \
