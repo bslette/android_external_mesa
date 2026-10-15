@@ -132,10 +132,20 @@ cmat_is_volta(uint8_t sm)
    return sm < 75;
 }
 
+/* Float matrices on Volta use the HMMA.884 layout below.  Integer matrices
+ * use IMMA.8816, which SM72 has with Turing's fragment layout, so they take
+ * the Turing paths.
+ */
+static bool
+cmat_volta_float(struct glsl_cmat_description desc, uint8_t sm)
+{
+   return cmat_is_volta(sm) && glsl_base_type_is_float(desc.element_type);
+}
+
 static unsigned
 get_cmat_length(struct glsl_cmat_description matrix_desc, uint8_t sm)
 {
-   if (cmat_is_volta(sm)) {
+   if (cmat_volta_float(matrix_desc, sm)) {
       assert(matrix_desc.rows == 16 && matrix_desc.cols == 16);
       if (matrix_desc.use == GLSL_CMAT_USE_ACCUMULATOR)
          return 8;
@@ -406,7 +416,7 @@ compute_matrix_offsets(struct nir_builder *b, struct glsl_cmat_description desc,
                        unsigned idx, nir_def **col_offset, nir_def **row_offset,
                        uint8_t sm)
 {
-   if (cmat_is_volta(sm)) {
+   if (cmat_volta_float(desc, sm)) {
       compute_mat_volta(b, desc, lane_id, idx, col_offset, row_offset);
       if (layout == GLSL_MATRIX_LAYOUT_COLUMN_MAJOR) {
          nir_def *tmp = *col_offset;
@@ -481,7 +491,7 @@ lower_cmat_muladd(nir_builder *b, nir_intrinsic_instr *intr, nir_def *cmat_a,
 {
    unsigned dst_length = get_cmat_length(d_desc, sm);
 
-   if (cmat_is_volta(sm)) {
+   if (cmat_volta_float(a_desc, sm)) {
       /* 16x16x16 as four k-chunks of HMMA.884 (each four STEPs in NAK) */
       assert(a_desc.rows == 16 && a_desc.cols == 16 &&
              b_desc.rows == 16 && b_desc.cols == 16 &&
@@ -616,7 +626,9 @@ lower_cmat_convert(nir_builder *b, nir_intrinsic_instr *intr, nir_def *cmat,
    /* TODO: on Volta, A/B and accumulators have different layouts and
     * lengths; only element type conversions within one use are supported.
     */
-   assert(!cmat_is_volta(sm) || a_desc.use == d_desc.use);
+   assert(!cmat_volta_float(a_desc, sm) || a_desc.use == d_desc.use);
+   /* float and integer matrices have different layouts on Volta */
+   assert(cmat_volta_float(a_desc, sm) == cmat_volta_float(d_desc, sm));
 
    nir_cmat_signed cmat_signed_mask = nir_intrinsic_cmat_signed_mask(intr);
 
@@ -638,9 +650,9 @@ lower_cmat_convert(nir_builder *b, nir_intrinsic_instr *intr, nir_def *cmat,
       cmat = nir_build_alu1(b, op, cmat);
 
    enum nak_matrix_type_layout a_layout =
-      cmat_is_volta(sm) ? NAK_MAT_16X16 : determine_matrix_type(a_desc);
+      cmat_volta_float(a_desc, sm) ? NAK_MAT_16X16 : determine_matrix_type(a_desc);
    enum nak_matrix_type_layout d_layout =
-      cmat_is_volta(sm) ? NAK_MAT_16X16 : determine_matrix_type(d_desc);
+      cmat_volta_float(d_desc, sm) ? NAK_MAT_16X16 : determine_matrix_type(d_desc);
 
    /* Matrix layout conversion code. For some conversions we also need
     * to fix the layout, so we shuffle values around to achieve that.
@@ -855,7 +867,7 @@ static int load_store_get_vec_size(const struct glsl_cmat_description desc,
 {
    unsigned bit_size = glsl_base_type_bit_size(desc.element_type);
 
-   if (cmat_is_volta(sm)) {
+   if (cmat_volta_float(desc, sm)) {
       /* A rows and B columns are contiguous in their own order: 8 halves
        * (16 bytes, the alignment the spec guarantees).  Accumulator elements
        * 2j, 2j + 1 are neighbours in a row.

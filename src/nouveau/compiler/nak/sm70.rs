@@ -179,6 +179,8 @@ impl ShaderModel for ShaderModel70 {
                 // CCTL.C needs 8, CCTL.I needs 11
                 11
             }
+            // Volta IMMA.8816: ptxas stalls 4 cycles between IMMAs on SM72
+            Op::Imma(_) if self.sm < 75 => 4,
             // Volta HMMA.884: ptxas stalls 2 cycles after STEP0..2 and 6 after
             // STEP3
             Op::Hmma(h) if h.mat_size == HmmaSize::M8N8K4 => {

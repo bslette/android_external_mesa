@@ -4292,7 +4292,8 @@ impl SM70Op for OpImma {
     }
 
     fn encode(&self, e: &mut SM70Encoder<'_>) {
-        assert!(e.sm >= 75);
+        // IMMA.8816 also exists on SM72 (Xavier), with the same encoding
+        assert!(e.sm >= 75 || (e.sm >= 72 && self.mat_size == ImmaSize::M8N8K16));
 
         e.set_opcode(0x237);
         e.set_dst(&self.dst);
