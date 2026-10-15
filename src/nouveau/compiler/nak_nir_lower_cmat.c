@@ -120,27 +120,47 @@ get_cmat_size(struct glsl_cmat_description matrix_desc)
    return matrix_desc.cols * matrix_desc.rows;
 }
 
-static unsigned
-get_cmat_length(struct glsl_cmat_description matrix_desc)
+/* Volta (SM70/72) has HMMA.884 only: four independent m8n8k4 products per
+ * warp, one per quad pair (lanes 4q..4q+3 and 4q+16..4q+19).  We support
+ * 16x16x16 with f16 A/B: quad pair q owns the 8x8 result tile
+ * (q & 1, q >> 1).  A lane holds a whole row of A and a whole column of B
+ * (each held by two quad pairs) and eight accumulator values.
+ */
+static bool
+cmat_is_volta(uint8_t sm)
 {
+   return sm < 75;
+}
+
+static unsigned
+get_cmat_length(struct glsl_cmat_description matrix_desc, uint8_t sm)
+{
+   if (cmat_is_volta(sm)) {
+      assert(matrix_desc.rows == 16 && matrix_desc.cols == 16);
+      if (matrix_desc.use == GLSL_CMAT_USE_ACCUMULATOR)
+         return 8;
+      assert(matrix_desc.element_type == GLSL_TYPE_FLOAT16);
+      return 16;
+   }
+
    return get_cmat_size(matrix_desc) / NAK_SUBGROUP_SIZE;
 }
 
 static nir_def *
-load_cmat_deref(nir_builder *b, nir_deref_instr *src)
+load_cmat_deref(nir_builder *b, nir_deref_instr *src, uint8_t sm)
 {
    struct glsl_cmat_description matrix_desc =
       *glsl_get_cmat_description(src->type);
 
    return nir_build_load_deref(
-      b, get_cmat_length(matrix_desc),
+      b, get_cmat_length(matrix_desc, sm),
       glsl_base_type_bit_size(matrix_desc.element_type), &src->def, 0);
 }
 
 static ALWAYS_INLINE nir_def *
-load_cmat_src(nir_builder *b, nir_src src)
+load_cmat_src(nir_builder *b, nir_src src, uint8_t sm)
 {
-   return load_cmat_deref(b, nir_src_as_deref(src));
+   return load_cmat_deref(b, nir_src_as_deref(src), sm);
 }
 
 static ALWAYS_INLINE struct glsl_cmat_description
@@ -151,25 +171,27 @@ cmat_src_desc(nir_src src)
 }
 
 static void
-store_cmat_deref(nir_builder *b, nir_deref_instr *dst, nir_def *val)
+store_cmat_deref(nir_builder *b, nir_deref_instr *dst, nir_def *val,
+                 uint8_t sm)
 {
    ASSERTED struct glsl_cmat_description matrix_desc =
       *glsl_get_cmat_description(dst->type);
 
    assert(val->bit_size == glsl_base_type_bit_size(matrix_desc.element_type));
-   assert(val->num_components == get_cmat_length(matrix_desc));
+   assert(val->num_components == get_cmat_length(matrix_desc, sm));
 
    nir_store_deref(b, dst, val, ~0);
 }
 
 static ALWAYS_INLINE void
-store_cmat_src(nir_builder *b, nir_src dst_src, nir_def *val)
+store_cmat_src(nir_builder *b, nir_src dst_src, nir_def *val, uint8_t sm)
 {
-   store_cmat_deref(b, nir_src_as_deref(dst_src), val);
+   store_cmat_deref(b, nir_src_as_deref(dst_src), val, sm);
 }
 
 static const struct glsl_type *
-remap_matrix_type(struct hash_table *mapping, const struct glsl_type *orig)
+remap_matrix_type(struct hash_table *mapping, const struct glsl_type *orig,
+                  uint8_t sm)
 {
    struct hash_entry *entry = _mesa_hash_table_search(mapping, orig);
 
@@ -183,11 +205,11 @@ remap_matrix_type(struct hash_table *mapping, const struct glsl_type *orig)
          *glsl_get_cmat_description(orig);
 
       new_type = glsl_vector_type(matrix_desc.element_type,
-                                  get_cmat_length(matrix_desc));
+                                  get_cmat_length(matrix_desc, sm));
    } else if (glsl_type_is_array(orig)) {
       const struct glsl_type *elem_type = glsl_get_array_element(orig);
       const struct glsl_type *new_elem_type =
-         remap_matrix_type(mapping, elem_type);
+         remap_matrix_type(mapping, elem_type, sm);
 
       if (elem_type != new_elem_type) {
          new_type = glsl_array_type(new_elem_type, glsl_get_length(orig),
@@ -198,7 +220,7 @@ remap_matrix_type(struct hash_table *mapping, const struct glsl_type *orig)
       for (i = 0; i < orig->length; i++) {
          const struct glsl_type *field_type = glsl_get_struct_field(orig, i);
          const struct glsl_type *new_field_type =
-            remap_matrix_type(mapping, field_type);
+            remap_matrix_type(mapping, field_type, sm);
 
          if (field_type != new_field_type) {
             break;
@@ -217,7 +239,7 @@ remap_matrix_type(struct hash_table *mapping, const struct glsl_type *orig)
          /* Remap the rest */
          for (; i < orig->length; i++) {
             fields[i] = *glsl_get_struct_field_data(orig, i);
-            fields[i].type = remap_matrix_type(mapping, fields[i].type);
+            fields[i].type = remap_matrix_type(mapping, fields[i].type, sm);
          }
 
          new_type =
@@ -233,9 +255,9 @@ remap_matrix_type(struct hash_table *mapping, const struct glsl_type *orig)
 }
 
 static bool
-uses_movm_for_bit_size(unsigned bit_size)
+uses_movm_for_bit_size(unsigned bit_size, uint8_t sm)
 {
-   return bit_size == 16;
+   return bit_size == 16 && !cmat_is_volta(sm);
 }
 
 /**
@@ -243,10 +265,10 @@ uses_movm_for_bit_size(unsigned bit_size)
  */
 static bool
 transpose_on_load_store(struct glsl_cmat_description desc,
-                        enum glsl_matrix_layout layout)
+                        enum glsl_matrix_layout layout, uint8_t sm)
 {
    return
-      uses_movm_for_bit_size(glsl_base_type_get_bit_size(desc.element_type)) &&
+      uses_movm_for_bit_size(glsl_base_type_get_bit_size(desc.element_type), sm) &&
       ((desc.use == GLSL_CMAT_USE_B && layout != GLSL_MATRIX_LAYOUT_COLUMN_MAJOR) ||
        (desc.use != GLSL_CMAT_USE_B && layout == GLSL_MATRIX_LAYOUT_COLUMN_MAJOR));
 }
@@ -342,14 +364,61 @@ compute_mat_16x16(struct nir_builder *b, nir_def *lane_id,
    compute_mat(b, lane_id, idx, col, row, alternate_tiling_order, 2);
 }
 
+/* Row and column of element idx of a lane on Volta, following the PTX
+ * fragment layouts of mma.m8n8k4.row.col (A row-major, B column-major,
+ * f32 accumulator).
+ */
+static void
+compute_mat_volta(struct nir_builder *b, struct glsl_cmat_description desc,
+                  nir_def *lane_id, unsigned idx,
+                  nir_def **col, nir_def **row)
+{
+   nir_def *t = nir_iand_imm(b, lane_id, 0x3);
+   nir_def *hi4 = nir_iand_imm(b, nir_ushr_imm(b, lane_id, 2), 0x4);
+   nir_def *qp = nir_iand_imm(b, nir_ushr_imm(b, lane_id, 2), 0x3);
+   nir_def *tile_row = nir_ishl_imm(b, nir_iand_imm(b, qp, 0x1), 3);
+   nir_def *tile_col = nir_ishl_imm(b, nir_ushr_imm(b, qp, 1), 3);
+
+   switch (desc.use) {
+   case GLSL_CMAT_USE_A:
+      *row = nir_iadd(b, nir_iadd(b, tile_row, hi4), t);
+      *col = nir_imm_int(b, idx);
+      break;
+   case GLSL_CMAT_USE_B:
+      *row = nir_imm_int(b, idx);
+      *col = nir_iadd(b, nir_iadd(b, tile_col, hi4), t);
+      break;
+   case GLSL_CMAT_USE_ACCUMULATOR:
+      *row = nir_iadd_imm(b, nir_iadd(b, nir_iadd(b, tile_row, hi4),
+                                      nir_iand_imm(b, t, 0x1)),
+                          idx & 0x2);
+      *col = nir_iadd_imm(b, nir_iadd(b, tile_col, nir_iand_imm(b, t, 0x2)),
+                          (idx & 0x4) + (idx & 0x1));
+      break;
+   default:
+      UNREACHABLE("invalid cmat use");
+   }
+}
+
 static void
 compute_matrix_offsets(struct nir_builder *b, struct glsl_cmat_description desc,
                        enum glsl_matrix_layout layout, nir_def *lane_id,
-                       unsigned idx, nir_def **col_offset, nir_def **row_offset)
+                       unsigned idx, nir_def **col_offset, nir_def **row_offset,
+                       uint8_t sm)
 {
+   if (cmat_is_volta(sm)) {
+      compute_mat_volta(b, desc, lane_id, idx, col_offset, row_offset);
+      if (layout == GLSL_MATRIX_LAYOUT_COLUMN_MAJOR) {
+         nir_def *tmp = *col_offset;
+         *col_offset = *row_offset;
+         *row_offset = tmp;
+      }
+      return;
+   }
+
    enum nak_matrix_type_layout cmat_type = determine_matrix_type(desc);
    unsigned bit_size = glsl_base_type_bit_size(desc.element_type);
-   bool uses_movm = uses_movm_for_bit_size(bit_size);
+   bool uses_movm = uses_movm_for_bit_size(bit_size, sm);
    bool alternate_tiling_order =
       (uses_movm && layout != GLSL_MATRIX_LAYOUT_ROW_MAJOR) ||
       (!uses_movm && desc.use == GLSL_CMAT_USE_B);
@@ -410,7 +479,32 @@ lower_cmat_muladd(nir_builder *b, nir_intrinsic_instr *intr, nir_def *cmat_a,
                   struct glsl_cmat_description c_desc,
                   struct glsl_cmat_description d_desc, uint8_t sm)
 {
-   unsigned dst_length = get_cmat_length(d_desc);
+   unsigned dst_length = get_cmat_length(d_desc, sm);
+
+   if (cmat_is_volta(sm)) {
+      /* 16x16x16 as four k-chunks of HMMA.884 (each four STEPs in NAK) */
+      assert(a_desc.rows == 16 && a_desc.cols == 16 &&
+             b_desc.rows == 16 && b_desc.cols == 16 &&
+             c_desc.rows == 16 && c_desc.cols == 16);
+      assert(a_desc.element_type == GLSL_TYPE_FLOAT16 &&
+             b_desc.element_type == GLSL_TYPE_FLOAT16);
+      const struct nak_nir_cmat_mul_add_flags vflags = {
+         .cmat_type = NAK_CMAT_TYPE_M8N8K4_FLOAT,
+         .a_type = GLSL_TYPE_FLOAT16,
+         .b_type = GLSL_TYPE_FLOAT16,
+      };
+      nir_def *acc = cmat_c;
+      if (acc->bit_size != 32)
+         acc = nir_f2f32(b, acc);
+      for (unsigned kc = 0; kc < 4; kc++) {
+         acc = nir_cmat_muladd_nv(b, 8, nir_channels(b, cmat_a, 0xfu << (4 * kc)),
+                                  nir_channels(b, cmat_b, 0xfu << (4 * kc)), acc,
+                                  .flags = NAK_AS_U32(vflags));
+      }
+      if (glsl_base_type_bit_size(d_desc.element_type) != 32)
+         acc = nir_f2f16(b, acc);
+      return acc;
+   }
 
    enum nak_cmat_type cmat_type =
       get_nak_cmat_type_for_muladd(a_desc, b_desc, c_desc);
@@ -433,9 +527,9 @@ lower_cmat_muladd(nir_builder *b, nir_intrinsic_instr *intr, nir_def *cmat_a,
                                 .flags = NAK_AS_U32(flags));
    }
 
-   unsigned a_length = get_cmat_length(a_desc);
-   unsigned b_length = get_cmat_length(b_desc);
-   unsigned c_length = get_cmat_length(c_desc);
+   unsigned a_length = get_cmat_length(a_desc, sm);
+   unsigned b_length = get_cmat_length(b_desc, sm);
+   unsigned c_length = get_cmat_length(c_desc, sm);
 
    nir_def *a_comps[NIR_MAX_VEC_COMPONENTS];
    nir_def *b_comps[NIR_MAX_VEC_COMPONENTS];
@@ -517,8 +611,13 @@ lower_cmat_muladd(nir_builder *b, nir_intrinsic_instr *intr, nir_def *cmat_a,
 static nir_def *
 lower_cmat_convert(nir_builder *b, nir_intrinsic_instr *intr, nir_def *cmat,
                    struct glsl_cmat_description a_desc,
-                   struct glsl_cmat_description d_desc)
+                   struct glsl_cmat_description d_desc, uint8_t sm)
 {
+   /* TODO: on Volta, A/B and accumulators have different layouts and
+    * lengths; only element type conversions within one use are supported.
+    */
+   assert(!cmat_is_volta(sm) || a_desc.use == d_desc.use);
+
    nir_cmat_signed cmat_signed_mask = nir_intrinsic_cmat_signed_mask(intr);
 
    enum glsl_base_type src_type = glsl_apply_signedness_to_base_type(
@@ -538,8 +637,10 @@ lower_cmat_convert(nir_builder *b, nir_intrinsic_instr *intr, nir_def *cmat,
    if (conv_narrows)
       cmat = nir_build_alu1(b, op, cmat);
 
-   enum nak_matrix_type_layout a_layout = determine_matrix_type(a_desc);
-   enum nak_matrix_type_layout d_layout = determine_matrix_type(d_desc);
+   enum nak_matrix_type_layout a_layout =
+      cmat_is_volta(sm) ? NAK_MAT_16X16 : determine_matrix_type(a_desc);
+   enum nak_matrix_type_layout d_layout =
+      cmat_is_volta(sm) ? NAK_MAT_16X16 : determine_matrix_type(d_desc);
 
    /* Matrix layout conversion code. For some conversions we also need
     * to fix the layout, so we shuffle values around to achieve that.
@@ -639,14 +740,19 @@ lower_cmat_convert(nir_builder *b, nir_intrinsic_instr *intr, nir_def *cmat,
 }
 
 static struct nir_def*
-try_lower_cmat_load_to_ldsm(nir_builder *b, nir_intrinsic_instr *intr)
+try_lower_cmat_load_to_ldsm(nir_builder *b, nir_intrinsic_instr *intr,
+                            uint8_t sm)
 {
    assert(intr->intrinsic == nir_intrinsic_cmat_load);
+
+   /* LDSM was added with Turing */
+   if (cmat_is_volta(sm))
+      return NULL;
 
    enum glsl_matrix_layout layout = nir_intrinsic_matrix_layout(intr);
 
    const struct glsl_cmat_description desc = cmat_src_desc(intr->src[0]);
-   const unsigned length = get_cmat_length(desc);
+   const unsigned length = get_cmat_length(desc, sm);
    nir_deref_instr *deref = nir_def_as_deref(intr->src[1].ssa);
    const unsigned ptr_bit_size = glsl_get_bit_size(deref->type);
    const unsigned vec = glsl_get_vector_elements(deref->type);
@@ -745,10 +851,26 @@ try_lower_cmat_load_to_ldsm(nir_builder *b, nir_intrinsic_instr *intr)
  * of the given cmat desc and layout
  */
 static int load_store_get_vec_size(const struct glsl_cmat_description desc,
-                                   enum glsl_matrix_layout layout)
+                                   enum glsl_matrix_layout layout, uint8_t sm)
 {
    unsigned bit_size = glsl_base_type_bit_size(desc.element_type);
-   bool uses_movm = uses_movm_for_bit_size(bit_size);
+
+   if (cmat_is_volta(sm)) {
+      /* A rows and B columns are contiguous in their own order: 8 halves
+       * (16 bytes, the alignment the spec guarantees).  Accumulator elements
+       * 2j, 2j + 1 are neighbours in a row.
+       */
+      switch (desc.use) {
+      case GLSL_CMAT_USE_A:
+         return layout == GLSL_MATRIX_LAYOUT_ROW_MAJOR ? 8 : 1;
+      case GLSL_CMAT_USE_B:
+         return layout == GLSL_MATRIX_LAYOUT_COLUMN_MAJOR ? 8 : 1;
+      default:
+         return layout == GLSL_MATRIX_LAYOUT_ROW_MAJOR ? 2 : 1;
+      }
+   }
+
+   bool uses_movm = uses_movm_for_bit_size(bit_size, sm);
    bool needs_transpose =
       (desc.use != GLSL_CMAT_USE_B && layout != GLSL_MATRIX_LAYOUT_ROW_MAJOR) ||
       (desc.use == GLSL_CMAT_USE_B && layout != GLSL_MATRIX_LAYOUT_COLUMN_MAJOR);
@@ -769,7 +891,7 @@ static int load_store_get_vec_size(const struct glsl_cmat_description desc,
 
 static nir_deref_instr*
 get_cmat_component_deref(nir_builder *b, nir_intrinsic_instr *intr,
-                         nir_def *lane_id, unsigned idx)
+                         nir_def *lane_id, unsigned idx, uint8_t sm)
 {
    unsigned deref_src = intr->intrinsic == nir_intrinsic_cmat_store ? 0 : 1;
    unsigned cmat_src = intr->intrinsic == nir_intrinsic_cmat_store ? 1 : 0;
@@ -784,7 +906,7 @@ get_cmat_component_deref(nir_builder *b, nir_intrinsic_instr *intr,
    nir_def *col_offset;
    nir_def *row_offset;
    compute_matrix_offsets(b, desc, layout, lane_id, idx,
-                              &col_offset, &row_offset);
+                              &col_offset, &row_offset, sm);
 
    row_offset = nir_imul(b, row_offset, stride);
    col_offset = nir_u2uN(b, col_offset, deref->def.bit_size);
@@ -828,17 +950,17 @@ get_cmat_component_deref(nir_builder *b, nir_intrinsic_instr *intr,
 }
 
 static void
-lower_cmat_load(nir_builder *b, nir_intrinsic_instr *intr)
+lower_cmat_load(nir_builder *b, nir_intrinsic_instr *intr, uint8_t sm)
 {
-   struct nir_def *ldsm = try_lower_cmat_load_to_ldsm(b, intr);
+   struct nir_def *ldsm = try_lower_cmat_load_to_ldsm(b, intr, sm);
    if (ldsm) {
-      store_cmat_src(b, intr->src[0], ldsm);
+      store_cmat_src(b, intr->src[0], ldsm, sm);
       return;
    }
 
    const struct glsl_cmat_description desc = cmat_src_desc(intr->src[0]);
    const enum glsl_matrix_layout layout = nir_intrinsic_matrix_layout(intr);
-   const unsigned length = get_cmat_length(desc);
+   const unsigned length = get_cmat_length(desc, sm);
 
    nir_def *vars[NIR_MAX_VEC_COMPONENTS];
    for (unsigned i = 0; i < length; ++i)
@@ -846,10 +968,10 @@ lower_cmat_load(nir_builder *b, nir_intrinsic_instr *intr)
 
    nir_def *lane_id = nir_load_subgroup_invocation(b);
 
-   int vec_size = load_store_get_vec_size(desc, layout);
+   int vec_size = load_store_get_vec_size(desc, layout, sm);
    for (unsigned idx = 0; idx < length; idx += vec_size) {
       nir_deref_instr *iter_deref =
-         get_cmat_component_deref(b, intr, lane_id, idx);
+         get_cmat_component_deref(b, intr, lane_id, idx, sm);
       nir_variable_mode modes = iter_deref->modes;
       const glsl_type *vec_type = glsl_vector_type(desc.element_type, vec_size);
       iter_deref = nir_build_deref_cast_with_alignment(b,
@@ -857,7 +979,7 @@ lower_cmat_load(nir_builder *b, nir_intrinsic_instr *intr)
          0, vec_size * glsl_base_type_bit_size(desc.element_type) / 8, 0);
 
       nir_def *value = nir_load_deref(b, iter_deref);
-      if (transpose_on_load_store(desc, layout))
+      if (transpose_on_load_store(desc, layout, sm))
          value = transpose_matrix(b, value);
 
       for (int c = 0; c < vec_size; c++)
@@ -865,7 +987,7 @@ lower_cmat_load(nir_builder *b, nir_intrinsic_instr *intr)
    }
 
    nir_def *mat = nir_vec(b, vars, length);
-   store_cmat_src(b, intr->src[0], mat);
+   store_cmat_src(b, intr->src[0], mat, sm);
 }
 
 static bool
@@ -878,7 +1000,7 @@ lower_cmat_instr(nir_builder *b,
    if (instr->type == nir_instr_type_deref) {
       nir_deref_instr *deref = nir_instr_as_deref(instr);
       const struct glsl_type *new_type =
-         remap_matrix_type(type_mapping, deref->type);
+         remap_matrix_type(type_mapping, deref->type, nak->sm);
 
       if (new_type != deref->type) {
          deref->type = new_type;
@@ -896,16 +1018,16 @@ lower_cmat_instr(nir_builder *b,
 
    switch (intr->intrinsic) {
    case nir_intrinsic_cmat_construct: {
-      const unsigned length = get_cmat_length(cmat_src_desc(intr->src[0]));
+      const unsigned length = get_cmat_length(cmat_src_desc(intr->src[0]), nak->sm);
       nir_def *r = nir_replicate(b, intr->src[1].ssa, length);
 
-      store_cmat_src(b, intr->src[0], r);
+      store_cmat_src(b, intr->src[0], r, nak->sm);
       nir_instr_remove(instr);
       return true;
    }
 
    case nir_intrinsic_cmat_load: {
-      lower_cmat_load(b, intr);
+      lower_cmat_load(b, intr, nak->sm);
       nir_instr_remove(instr);
       return true;
    }
@@ -913,8 +1035,8 @@ lower_cmat_instr(nir_builder *b,
    case nir_intrinsic_cmat_store: {
       const struct glsl_cmat_description desc = cmat_src_desc(intr->src[1]);
       const enum glsl_matrix_layout layout = nir_intrinsic_matrix_layout(intr);
-      const unsigned length = get_cmat_length(desc);
-      nir_def *src = load_cmat_src(b, intr->src[1]);
+      const unsigned length = get_cmat_length(desc, nak->sm);
+      nir_def *src = load_cmat_src(b, intr->src[1], nak->sm);
 
       nir_def *vars[NIR_MAX_VEC_COMPONENTS];
       for (unsigned i = 0; i < length; i++)
@@ -922,10 +1044,10 @@ lower_cmat_instr(nir_builder *b,
 
       nir_def *lane_id = nir_load_subgroup_invocation(b);
 
-      int vec_size = load_store_get_vec_size(desc, layout);
+      int vec_size = load_store_get_vec_size(desc, layout, nak->sm);
       for (unsigned idx = 0; idx < length; idx += vec_size) {
          nir_deref_instr *iter_deref =
-            get_cmat_component_deref(b, intr, lane_id, idx);
+            get_cmat_component_deref(b, intr, lane_id, idx, nak->sm);
 
          nir_variable_mode modes = iter_deref->modes;
          const glsl_type *vec_type = glsl_vector_type(desc.element_type, vec_size);
@@ -933,7 +1055,7 @@ lower_cmat_instr(nir_builder *b,
             &iter_deref->def, modes, vec_type,
             0, vec_size * glsl_base_type_bit_size(desc.element_type) / 8, 0);
          nir_def *value = nir_vec(b, &vars[idx], vec_size);
-         if (transpose_on_load_store(desc, layout))
+         if (transpose_on_load_store(desc, layout, nak->sm))
             value = transpose_matrix(b, value);
          nir_store_deref(b, iter_deref, value, -1);
       }
@@ -943,7 +1065,7 @@ lower_cmat_instr(nir_builder *b,
    }
 
    case nir_intrinsic_cmat_length: {
-      const unsigned length = get_cmat_length(nir_intrinsic_cmat_desc(intr));
+      const unsigned length = get_cmat_length(nir_intrinsic_cmat_desc(intr), nak->sm);
       nir_def_replace(&intr->def, nir_imm_int(b, length));
       return true;
    }
@@ -955,24 +1077,24 @@ lower_cmat_instr(nir_builder *b,
       const struct glsl_cmat_description b_desc = cmat_src_desc(intr->src[2]);
       const struct glsl_cmat_description c_desc = cmat_src_desc(intr->src[3]);
 
-      nir_def *cmat_a = load_cmat_src(b, intr->src[1]);
-      nir_def *cmat_b = load_cmat_src(b, intr->src[2]);
-      nir_def *cmat_c = load_cmat_src(b, intr->src[3]);
+      nir_def *cmat_a = load_cmat_src(b, intr->src[1], nak->sm);
+      nir_def *cmat_b = load_cmat_src(b, intr->src[2], nak->sm);
+      nir_def *cmat_c = load_cmat_src(b, intr->src[3], nak->sm);
 
       nir_def *ret = lower_cmat_muladd(b, intr, cmat_a, cmat_b, cmat_c, a_desc,
                                        b_desc, c_desc, d_desc, nak->sm);
-      store_cmat_src(b, intr->src[0], ret);
+      store_cmat_src(b, intr->src[0], ret, nak->sm);
       nir_instr_remove(&intr->instr);
       return true;
    }
 
    case nir_intrinsic_cmat_unary_op: {
-      nir_def *src = load_cmat_src(b, intr->src[1]);
+      nir_def *src = load_cmat_src(b, intr->src[1], nak->sm);
       nir_op op = nir_intrinsic_alu_op(intr);
       b->fp_math_ctrl = nir_intrinsic_fp_math_ctrl(intr);
 
       nir_def *ret = nir_build_alu1(b, op, src);
-      store_cmat_src(b, intr->src[0], ret);
+      store_cmat_src(b, intr->src[0], ret, nak->sm);
 
       nir_instr_remove(instr);
       b->fp_math_ctrl = nir_fp_fast_math;
@@ -980,13 +1102,13 @@ lower_cmat_instr(nir_builder *b,
    }
 
    case nir_intrinsic_cmat_binary_op: {
-      nir_def *src_a = load_cmat_src(b, intr->src[1]);
-      nir_def *src_b = load_cmat_src(b, intr->src[2]);
+      nir_def *src_a = load_cmat_src(b, intr->src[1], nak->sm);
+      nir_def *src_b = load_cmat_src(b, intr->src[2], nak->sm);
       nir_op op = nir_intrinsic_alu_op(intr);
       b->fp_math_ctrl = nir_intrinsic_fp_math_ctrl(intr);
 
       nir_def *ret = nir_build_alu2(b, op, src_a, src_b);
-      store_cmat_src(b, intr->src[0], ret);
+      store_cmat_src(b, intr->src[0], ret, nak->sm);
 
       nir_instr_remove(instr);
       b->fp_math_ctrl = nir_fp_fast_math;
@@ -994,12 +1116,12 @@ lower_cmat_instr(nir_builder *b,
    }
 
    case nir_intrinsic_cmat_scalar_op: {
-      nir_def *src_a = load_cmat_src(b, intr->src[1]);
+      nir_def *src_a = load_cmat_src(b, intr->src[1], nak->sm);
       nir_op op = nir_intrinsic_alu_op(intr);
       b->fp_math_ctrl = nir_intrinsic_fp_math_ctrl(intr);
 
       nir_def *ret = nir_build_alu2(b, op, src_a, intr->src[2].ssa);
-      store_cmat_src(b, intr->src[0], ret);
+      store_cmat_src(b, intr->src[0], ret, nak->sm);
 
       nir_instr_remove(instr);
       b->fp_math_ctrl = nir_fp_fast_math;
@@ -1007,14 +1129,14 @@ lower_cmat_instr(nir_builder *b,
    }
 
    case nir_intrinsic_cmat_bitcast: {
-      nir_def *mat = load_cmat_src(b, intr->src[1]);
-      store_cmat_src(b, intr->src[0], mat);
+      nir_def *mat = load_cmat_src(b, intr->src[1], nak->sm);
+      store_cmat_src(b, intr->src[0], mat, nak->sm);
       nir_instr_remove(instr);
       return true;
    }
 
    case nir_intrinsic_cmat_extract: {
-      nir_def *mat = load_cmat_src(b, intr->src[0]);
+      nir_def *mat = load_cmat_src(b, intr->src[0], nak->sm);
       nir_def *index = intr->src[1].ssa;
       nir_def *elem = nir_vector_extract(b, mat, index);
       nir_def_replace(&intr->def, elem);
@@ -1023,11 +1145,11 @@ lower_cmat_instr(nir_builder *b,
 
    case nir_intrinsic_cmat_insert: {
       nir_def *elem = intr->src[1].ssa;
-      nir_def *mat = load_cmat_src(b, intr->src[2]);
+      nir_def *mat = load_cmat_src(b, intr->src[2], nak->sm);
       nir_def *index = intr->src[3].ssa;
 
       nir_def *r = nir_vector_insert(b, mat, elem, index);
-      store_cmat_src(b, intr->src[0], r);
+      store_cmat_src(b, intr->src[0], r, nak->sm);
 
       nir_instr_remove(instr);
       return true;
@@ -1044,9 +1166,9 @@ lower_cmat_instr(nir_builder *b,
       struct glsl_cmat_description src_desc = cmat_src_desc(intr->src[1]);
       b->fp_math_ctrl = nir_intrinsic_fp_math_ctrl(intr);
 
-      nir_def *cmat = load_cmat_src(b, intr->src[1]);
-      nir_def *ret = lower_cmat_convert(b, intr, cmat, src_desc, dst_desc);
-      store_cmat_src(b, intr->src[0], ret);
+      nir_def *cmat = load_cmat_src(b, intr->src[1], nak->sm);
+      nir_def *ret = lower_cmat_convert(b, intr, cmat, src_desc, dst_desc, nak->sm);
+      store_cmat_src(b, intr->src[0], ret, nak->sm);
 
       nir_instr_remove(instr);
       b->fp_math_ctrl = nir_fp_fast_math;
@@ -1068,7 +1190,7 @@ lower_cmat_impl(nir_function_impl *impl,
    /* Remap all cmat temp var to array of scalars */
    nir_foreach_function_temp_variable(var, impl) {
       const struct glsl_type *new_type =
-         remap_matrix_type(type_mapping, var->type);
+         remap_matrix_type(type_mapping, var->type, nak->sm);
       if (new_type != var->type) {
          var->type = new_type;
          progress = true;
@@ -1100,7 +1222,7 @@ nak_nir_lower_cmat(nir_shader *nir, const struct nak_compiler *nak)
    /* Remap all cmat shader temp var to array of scalars */
    nir_foreach_variable_with_modes(var, nir, nir_var_shader_temp) {
       const struct glsl_type *new_type =
-         remap_matrix_type(type_mapping, var->type);
+         remap_matrix_type(type_mapping, var->type, nak->sm);
 
       if (new_type != var->type) {
          var->type = new_type;
