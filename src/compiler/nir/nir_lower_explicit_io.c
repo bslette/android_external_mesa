@@ -1525,7 +1525,49 @@ nir_lower_explicit_io_instr(nir_builder *b,
             nir_push_else(b, NULL);
          }
       }
-      if (scalarize) {
+      if (fast) {
+         /* Part of the vector is out of bounds.  Check each component, but
+          * without a branch per component: load every component, taking the
+          * address of the last scalar in the buffer for the ones that are out
+          * of bounds, and select zero for those.  Even a fallback that never
+          * runs costs time when it is a chain of branches.  An empty buffer
+          * (e.g. a null descriptor) has no address to load from at all.
+          */
+         const unsigned bit_size = intrin->def.bit_size;
+         nir_def *zero = nir_imm_zero(b, intrin->num_components, bit_size);
+         nir_def *size =
+            nir_channel(b, build_addr(b, intrin, base_addr, addr_format, 0,
+                                      align_mul, align_offset).def, 2);
+         nir_push_if(b, nir_uge_imm(b, size, scalar_size));
+         nir_def *last = nir_iand_imm(b, nir_iadd_imm(b, size, -(int64_t)scalar_size),
+                                      ~(uint64_t)(scalar_size - 1));
+         nir_def *comps[NIR_MAX_VEC_COMPONENTS] = {
+            NULL,
+         };
+         for (unsigned i = 0; i < intrin->num_components; i++) {
+            unsigned comp_offset = i * vec_stride;
+            nir_def *caddr = build_addr(b, intrin, base_addr, addr_format,
+                                        comp_offset, align_mul,
+                                        align_offset).def;
+            nir_def *in = addr_is_in_bounds(b, caddr, addr_format, scalar_size);
+            nir_def *off = nir_bcsel(b, in, nir_channel(b, caddr, 3), last);
+            nir_io_offset gaddr = {
+               .def = addr_to_global(b, nir_vector_insert_imm(b, caddr, off, 3),
+                                     addr_format),
+               .shift = 0,
+            };
+            nir_def *comp = build_explicit_io_load(b, intrin, gaddr,
+                                                   nir_address_format_64bit_global,
+                                                   deref->modes, scalar_size, 0,
+                                                   1, comp_offset, scalar_size);
+            comps[i] = nir_bcsel(b, in, comp, nir_imm_zero(b, 1, bit_size));
+         }
+         nir_def *partial = nir_vec(b, comps, intrin->num_components);
+         nir_pop_if(b, NULL);
+         value = nir_if_phi(b, partial, zero);
+         nir_pop_if(b, NULL);
+         value = nir_if_phi(b, fast, value);
+      } else if (scalarize) {
          nir_def *comps[NIR_MAX_VEC_COMPONENTS] = {
             NULL,
          };
