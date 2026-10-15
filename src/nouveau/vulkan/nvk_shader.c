@@ -363,6 +363,23 @@ lookup_ycbcr_conversion(const void *_state, uint32_t set,
           &sampler->vk.ycbcr_conversion->state : NULL;
 }
 
+static bool
+nvk_ssbo_vectorize_cb(unsigned align_mul, unsigned align_offset,
+                      unsigned bit_size, unsigned num_components,
+                      int64_t hole_size, nir_intrinsic_instr *low,
+                      nir_intrinsic_instr *high, void *cb_data)
+{
+   if (hole_size > 0)
+      return false;
+
+   if (num_components > 4 && !util_is_power_of_two_nonzero(num_components))
+      return false;
+
+   /* At most one naturally aligned 128-bit access */
+   const unsigned bytes = num_components * (bit_size / 8);
+   return bytes <= 16 && bytes <= nir_combined_align(align_mul, align_offset);
+}
+
 static void
 nvk_lower_nir(struct nvk_device *dev, nir_shader *nir,
               VkShaderCreateFlagsEXT shader_flags,
@@ -460,6 +477,21 @@ nvk_lower_nir(struct nvk_device *dev, nir_shader *nir,
 
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_global,
             nir_address_format_64bit_global);
+   if (nvk_ssbo_addr_format(pdev, rs) == nir_address_format_64bit_bounded_global &&
+       !nir->options->has_load_global_bounded) {
+      /* Without hardware bounded loads, nir_lower_explicit_io puts each
+       * bounds-checked access in its own branch, and the vectorizer in NAK
+       * cannot merge accesses across branches afterwards.  Merge adjacent
+       * SSBO accesses while they are still derefs so each merged vector gets
+       * a single bounds check.
+       */
+      nir_load_store_vectorize_options vectorize_opts = {
+         .modes = nir_var_mem_ssbo,
+         .callback = nvk_ssbo_vectorize_cb,
+         .robust_modes = nir_var_mem_ssbo,
+      };
+      NIR_PASS(_, nir, nir_opt_load_store_vectorize, &vectorize_opts);
+   }
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo,
             nvk_ssbo_addr_format(pdev, rs));
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ubo,
