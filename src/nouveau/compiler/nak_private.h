@@ -389,6 +389,9 @@ enum nak_cmat_type {
    NAK_CMAT_TYPE_M16N8K8_FLOAT,
    NAK_CMAT_TYPE_M16N8K16_FLOAT,
 
+   /* Volta HMMA.884: one m8n8k4 per quad pair, f16 A/B, f32 C/D */
+   NAK_CMAT_TYPE_M8N8K4_FLOAT,
+
    /* Software emulated cmat layouts
     *
     * Those aren't supported as a single native *MMA invocation on any hardware,

@@ -4349,8 +4349,27 @@ impl SM70Op for OpHmma {
     }
 
     fn encode(&self, e: &mut SM70Encoder<'_>) {
-        assert!(e.sm >= 75);
+        if e.sm < 75 {
+            // Volta HMMA.884, as ptxas encodes it for sm_72: A row-major,
+            // B column-major (bit 74), D f32 (bit 76), C f32 (bit 78), STEP
+            // in bits 79..81.  Bit 73 would make A column-major.
+            assert!(self.mat_size == HmmaSize::M8N8K4);
+            assert!(self.src_type == FloatType::F16);
+            assert!(self.dst_type == FloatType::F32);
+            assert!(self.step < 4);
+            e.set_opcode(0x236);
+            e.set_dst(&self.dst);
+            e.set_reg_src(24..32, &self.srcs[0]);
+            e.set_reg_src(32..40, &self.srcs[1]);
+            e.set_reg_src(64..72, &self.srcs[2]);
+            e.set_bit(74, true);
+            e.set_bit(76, true);
+            e.set_bit(78, true);
+            e.set_field(79..81, self.step);
+            return;
+        }
 
+        assert!(self.mat_size != HmmaSize::M8N8K4);
         e.set_opcode(0x23c);
         e.set_dst(&self.dst);
         e.set_reg_src(24..32, &self.srcs[0]);
@@ -4369,6 +4388,7 @@ impl SM70Op for OpHmma {
                 HmmaSize::M16N8K8 => 0u8,
                 HmmaSize::M16N8K16 => 1u8,
                 HmmaSize::M16N8K4 => 2u8,
+                HmmaSize::M8N8K4 => unreachable!(),
             },
         );
 
