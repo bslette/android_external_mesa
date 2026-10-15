@@ -4073,10 +4073,14 @@ impl<'a> ShaderFromNir<'a> {
                 let cmat_b = self.get_src(&srcs[1]);
                 let cmat_c = self.get_src(&srcs[2]);
                 let dst_bit_size = intrin.def.bit_size();
+                // u8 * u8 overflows for an 8 x 32-bit result (Volta)
                 let dst = b.alloc_ssa_vec(
                     RegFile::GPR,
-                    (intrin.def.num_components() * intrin.def.bit_size)
-                        .div_ceil(32),
+                    (u32::from(intrin.def.num_components())
+                        * u32::from(intrin.def.bit_size))
+                    .div_ceil(32)
+                    .try_into()
+                    .unwrap(),
                 );
                 let dst_type = FloatType::from_bits(dst_bit_size.into());
                 match flags.cmat_type() {
