@@ -1497,6 +1497,34 @@ nir_lower_explicit_io_instr(nir_builder *b,
    switch (intrin->intrinsic) {
    case nir_intrinsic_load_deref: {
       nir_def *value;
+      nir_def *fast = NULL;
+      if (scalarize && addr_format_needs_bounds_check(addr_format) &&
+          intrin->num_components > 1 && vec_stride == scalar_size &&
+          deref->modes == nir_var_mem_ssbo &&
+          !b->shader->options->has_load_global_bounded) {
+         /* Per-component bounds checking puts every component load behind its
+          * own branch, which keeps the load/store vectorizer from merging them
+          * again: an f16vec4 becomes four 16-bit loads.  When the whole vector
+          * is in bounds every component is, so do one check and one vector
+          * load, and only take the per-component path below otherwise.
+          */
+         nir_io_offset vaddr = build_addr(b, intrin, base_addr, addr_format, 0,
+                                          align_mul, align_offset);
+         if (vaddr.shift == 0) {
+            const unsigned vsize = intrin->num_components * scalar_size;
+            nir_push_if(b, addr_is_in_bounds(b, vaddr.def, addr_format, vsize));
+            nir_io_offset gaddr = {
+               .def = addr_to_global(b, vaddr.def, addr_format),
+               .shift = 0,
+            };
+            fast = build_explicit_io_load(b, intrin, gaddr,
+                                          nir_address_format_64bit_global,
+                                          deref->modes, align_mul,
+                                          align_offset, intrin->num_components,
+                                          0, vsize);
+            nir_push_else(b, NULL);
+         }
+      }
       if (scalarize) {
          nir_def *comps[NIR_MAX_VEC_COMPONENTS] = {
             NULL,
@@ -1514,6 +1542,10 @@ nir_lower_explicit_io_instr(nir_builder *b,
                                               1, comp_offset, scalar_size);
          }
          value = nir_vec(b, comps, intrin->num_components);
+         if (fast) {
+            nir_pop_if(b, NULL);
+            value = nir_if_phi(b, fast, value);
+         }
       } else {
          nir_io_offset addr = build_addr(b, intrin, base_addr, addr_format, 0,
                                          align_mul, align_offset);
@@ -1529,6 +1561,31 @@ nir_lower_explicit_io_instr(nir_builder *b,
    case nir_intrinsic_store_deref: {
       nir_def *value = intrin->src[1].ssa;
       nir_component_mask_t write_mask = nir_intrinsic_write_mask(intrin);
+      bool fast_store = false;
+      if (scalarize && addr_format_needs_bounds_check(addr_format) &&
+          intrin->num_components > 1 && vec_stride == scalar_size &&
+          write_mask == BITFIELD_MASK(intrin->num_components) &&
+          deref->modes == nir_var_mem_ssbo) {
+         /* Same as for loads: one check and one vector store when the whole
+          * vector is in bounds, per-component stores otherwise.
+          */
+         nir_io_offset vaddr = build_addr(b, intrin, base_addr, addr_format, 0,
+                                          align_mul, align_offset);
+         if (vaddr.shift == 0) {
+            const unsigned vsize = intrin->num_components * scalar_size;
+            nir_push_if(b, addr_is_in_bounds(b, vaddr.def, addr_format, vsize));
+            nir_io_offset gaddr = {
+               .def = addr_to_global(b, vaddr.def, addr_format),
+               .shift = 0,
+            };
+            build_explicit_io_store(b, intrin, gaddr,
+                                    nir_address_format_64bit_global,
+                                    deref->modes, align_mul, align_offset,
+                                    value, write_mask);
+            nir_push_else(b, NULL);
+            fast_store = true;
+         }
+      }
       if (scalarize) {
          for (unsigned i = 0; i < intrin->num_components; i++) {
             if (!(write_mask & (1 << i)))
@@ -1543,6 +1600,8 @@ nir_lower_explicit_io_instr(nir_builder *b,
                                     (align_offset + comp_offset) % align_mul,
                                     nir_channel(b, value, i), 1);
          }
+         if (fast_store)
+            nir_pop_if(b, NULL);
       } else {
          nir_io_offset addr = build_addr(b, intrin, base_addr, addr_format, 0,
                                          align_mul, align_offset);
