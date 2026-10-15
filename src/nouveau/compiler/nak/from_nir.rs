@@ -4100,8 +4100,37 @@ impl<'a> ShaderFromNir<'a> {
                             dst_type: dst_type,
                             src_type: FloatType::F16,
                             mat_size: mat_size,
+                            step: 0,
                             srcs: [cmat_a, cmat_b, cmat_c],
                         });
+                    }
+                    NAK_CMAT_TYPE_M8N8K4_FLOAT => {
+                        // Volta: A and B are f16x4 (two registers each), C
+                        // and D eight f32.  STEP s reads and writes result
+                        // registers 2s and 2s + 1.
+                        assert_eq!(flags.a_type(), GLSL_TYPE_FLOAT16);
+                        assert_eq!(flags.b_type(), GLSL_TYPE_FLOAT16);
+                        assert!(!flags.sat());
+                        assert!(dst_type == FloatType::F32);
+                        let c = self.get_ssa(srcs[2].as_def()).to_vec();
+                        assert_eq!(c.len(), 8);
+                        for step in 0..4_u8 {
+                            let s = usize::from(step) * 2;
+                            let c_pair = SSARef::try_from(&c[s..s + 2]).unwrap();
+                            let d_pair = SSARef::try_from(&dst[s..s + 2]).unwrap();
+                            b.push_op(OpHmma {
+                                dst: d_pair.into(),
+                                dst_type: FloatType::F32,
+                                src_type: FloatType::F16,
+                                mat_size: HmmaSize::M8N8K4,
+                                step,
+                                srcs: [
+                                    cmat_a.clone(),
+                                    cmat_b.clone(),
+                                    c_pair.into(),
+                                ],
+                            });
+                        }
                     }
                     NAK_CMAT_TYPE_M8N8K16_INT
                     | NAK_CMAT_TYPE_M16N8K16_INT

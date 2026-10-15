@@ -3536,6 +3536,11 @@ pub enum HmmaSize {
     M16N8K16,
     M16N8K8,
     M16N8K4,
+    /// Volta: four independent m8n8k4 products, one per quad pair (lanes
+    /// 4q..4q+3 and 4q+16..4q+19).  With an f32 accumulator the operation
+    /// takes four instructions, STEP0..3, each producing two of the eight
+    /// result registers.
+    M8N8K4,
 }
 
 impl fmt::Display for HmmaSize {
@@ -3544,6 +3549,7 @@ impl fmt::Display for HmmaSize {
             HmmaSize::M16N8K16 => write!(f, ".m16n8k16"),
             HmmaSize::M16N8K8 => write!(f, ".m16n8k8"),
             HmmaSize::M16N8K4 => write!(f, ".m16n8k4"),
+            HmmaSize::M8N8K4 => write!(f, ".m8n8k4"),
         }
     }
 }
@@ -3557,6 +3563,8 @@ pub struct OpHmma {
     pub mat_size: HmmaSize,
     pub src_type: FloatType,
     pub dst_type: FloatType,
+    /// STEP of a Volta M8N8K4 operation, 0 otherwise
+    pub step: u8,
 
     #[src_type(SSA)]
     pub srcs: [Src; 3],
@@ -3566,9 +3574,14 @@ impl DisplayOp for OpHmma {
     fn fmt_op(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "hmma{}{} {} {} {}",
+            "hmma{}{}{} {} {} {}",
             self.mat_size,
             self.dst_type,
+            if self.mat_size == HmmaSize::M8N8K4 {
+                format!(".step{}", self.step)
+            } else {
+                String::new()
+            },
             self.srcs[0],
             self.srcs[1],
             self.srcs[2],
