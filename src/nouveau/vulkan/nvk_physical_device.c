@@ -4,6 +4,8 @@
  */
 #include "nvk_physical_device.h"
 
+#include "util/u_debug.h"
+
 #include "nak.h"
 #include "nvk_buffer.h"
 #include "nvk_descriptor_types.h"
@@ -108,6 +110,16 @@ nvk_has_astc(const struct nv_device_info *info)
    return info->type == NV_DEVICE_TYPE_SOC && info->cls_eng3d >= KEPLER_C;
 }
 
+/* Volta tensor cores (HMMA.884) for VK_KHR_cooperative_matrix: experimental,
+ * opt-in with NVK_VOLTA_CMAT=1.  Only 16x16x16, f16 A/B, f32 C/D.
+ */
+static bool
+nvk_volta_cmat(const struct nv_device_info *info)
+{
+   return info->cls_eng3d >= VOLTA_A && info->cls_eng3d < TURING_A &&
+          debug_get_bool_option("NVK_VOLTA_CMAT", false);
+}
+
 static void
 nvk_get_device_extensions(const struct nvk_instance *instance,
                           const struct nv_device_info *info,
@@ -121,7 +133,8 @@ nvk_get_device_extensions(const struct nvk_instance *instance,
       .KHR_buffer_device_address = true,
       .KHR_calibrated_timestamps = true,
       .KHR_compute_shader_derivatives = info->cls_eng3d >= TURING_A,
-      .KHR_cooperative_matrix = info->cls_eng3d >= TURING_A,
+      .KHR_cooperative_matrix = info->cls_eng3d >= TURING_A ||
+                                nvk_volta_cmat(info),
       .KHR_copy_commands2 = true,
       .KHR_copy_memory_indirect = true,
       .KHR_create_renderpass2 = true,
@@ -496,7 +509,8 @@ nvk_get_device_features(const struct nv_device_info *info,
 
       /* VK_KHR_cooperative_matrix */
       /* TU11X can run coop matrix but the performances are abysal */
-      .cooperativeMatrix = info->cls_eng3d >= TURING_A && !is_tu11x,
+      .cooperativeMatrix = (info->cls_eng3d >= TURING_A && !is_tu11x) ||
+                           nvk_volta_cmat(info),
       .cooperativeMatrixRobustBufferAccess = false,
 
       /* VK_KHR_compute_shader_derivatives */
@@ -1957,6 +1971,27 @@ nvk_GetPhysicalDeviceCooperativeMatrixPropertiesKHR(VkPhysicalDevice physicalDev
 
    if (pdev->info.cls_compute < VOLTA_COMPUTE_A)
       return VK_SUCCESS;
+
+   if (pdev->info.cls_compute < TURING_COMPUTE_A) {
+      if (nvk_volta_cmat(&pdev->info)) {
+         vk_outarray_append_typed(VkCooperativeMatrixPropertiesKHR, &out, p)
+         {
+            *p = (struct VkCooperativeMatrixPropertiesKHR){
+               .sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR,
+               .MSize = 16,
+               .NSize = 16,
+               .KSize = 16,
+               .AType = VK_COMPONENT_TYPE_FLOAT16_KHR,
+               .BType = VK_COMPONENT_TYPE_FLOAT16_KHR,
+               .CType = VK_COMPONENT_TYPE_FLOAT32_KHR,
+               .ResultType = VK_COMPONENT_TYPE_FLOAT32_KHR,
+               .saturatingAccumulation = false,
+               .scope = VK_SCOPE_SUBGROUP_KHR
+            };
+         }
+      }
+      return vk_outarray_status(&out);
+   }
 
    if (pdev->info.cls_compute >= TURING_COMPUTE_A) {
       for (int use_result_f32 = 0; use_result_f32 < 2; use_result_f32++) {
