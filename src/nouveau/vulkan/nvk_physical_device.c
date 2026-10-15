@@ -110,8 +110,9 @@ nvk_has_astc(const struct nv_device_info *info)
    return info->type == NV_DEVICE_TYPE_SOC && info->cls_eng3d >= KEPLER_C;
 }
 
-/* Volta tensor cores (HMMA.884) for VK_KHR_cooperative_matrix: experimental,
- * opt-in with NVK_VOLTA_CMAT=1.  Only 16x16x16, f16 A/B, f32 C/D.
+/* Volta tensor cores for VK_KHR_cooperative_matrix: experimental, opt-in
+ * with NVK_VOLTA_CMAT=1.  HMMA.884: 16x16x16, f16 A/B, f32 C/D.  SM72 also
+ * has IMMA.8816 for int8 (Turing's shapes minus the Ampere ones).
  */
 static bool
 nvk_volta_cmat(const struct nv_device_info *info)
@@ -1990,7 +1991,6 @@ nvk_GetPhysicalDeviceCooperativeMatrixPropertiesKHR(VkPhysicalDevice physicalDev
             };
          }
       }
-      return vk_outarray_status(&out);
    }
 
    if (pdev->info.cls_compute >= TURING_COMPUTE_A) {
@@ -2047,8 +2047,9 @@ nvk_GetPhysicalDeviceCooperativeMatrixPropertiesKHR(VkPhysicalDevice physicalDev
       }
    }
 
-   /* IMMA got added with Turing */
-   if (pdev->info.cls_compute >= TURING_COMPUTE_A) {
+   /* IMMA got added with Turing, and SM72 (Xavier) has IMMA.8816 too */
+   if (pdev->info.cls_compute >= TURING_COMPUTE_A ||
+       (nvk_volta_cmat(&pdev->info) && pdev->info.sm >= 72)) {
       for (int sat = 0; sat < 2; sat++) {
          for (unsigned is_signed = 0; is_signed < 2; is_signed++) {
             const VkComponentTypeKHR input_type_ab = is_signed ? VK_COMPONENT_TYPE_SINT8_KHR  : VK_COMPONENT_TYPE_UINT8_KHR;
