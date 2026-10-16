@@ -375,8 +375,8 @@ compute_mat_16x16(struct nir_builder *b, nir_def *lane_id,
 }
 
 /* Row and column of element idx of a lane on Volta, following the PTX
- * fragment layouts of mma.m8n8k4.row.col (A row-major, B column-major,
- * f32 accumulator).
+ * fragment layouts of mma.m8n8k4.row.col (A row-major, B column-major).
+ * f32 and f16 accumulators have different layouts.
  */
 static void
 compute_mat_volta(struct nir_builder *b, struct glsl_cmat_description desc,
@@ -399,6 +399,12 @@ compute_mat_volta(struct nir_builder *b, struct glsl_cmat_description desc,
       *col = nir_iadd(b, nir_iadd(b, tile_col, hi4), t);
       break;
    case GLSL_CMAT_USE_ACCUMULATOR:
+      if (desc.element_type == GLSL_TYPE_FLOAT16) {
+         /* f16: a lane holds 8 consecutive columns of one row */
+         *row = nir_iadd(b, nir_iadd(b, tile_row, hi4), t);
+         *col = nir_iadd_imm(b, tile_col, idx);
+         break;
+      }
       *row = nir_iadd_imm(b, nir_iadd(b, nir_iadd(b, tile_row, hi4),
                                       nir_iand_imm(b, t, 0x1)),
                           idx & 0x2);
@@ -481,6 +487,30 @@ get_hw_nak_cmat_type(enum nak_cmat_type cmat_type, uint8_t sm)
    }
 }
 
+/* Moves a Volta 16x16 accumulator between the f32 and the f16 layout (see
+ * compute_mat_volta).  Element i of lane L in one layout is element
+ * (L & 2) | (i & 5) of lane (L & 0x1d) | (i & 2) in the other; the map is
+ * its own inverse.  The source element depends on lane bit 1, so each
+ * result element is two shuffles and a select.
+ */
+static nir_def *
+volta_acc_relayout(nir_builder *b, nir_def *cmat)
+{
+   assert(cmat->num_components == 8);
+   nir_def *lane = nir_load_subgroup_invocation(b);
+   nir_def *base = nir_iand_imm(b, lane, 0x1d);
+   nir_def *pick_hi = nir_ine_imm(b, nir_iand_imm(b, lane, 0x2), 0);
+   nir_def *comps[8];
+
+   for (unsigned i = 0; i < 8; i++) {
+      nir_def *src_lane = nir_ior_imm(b, base, i & 2);
+      nir_def *lo = nir_shuffle(b, nir_channel(b, cmat, i & 5), src_lane);
+      nir_def *hi = nir_shuffle(b, nir_channel(b, cmat, (i & 5) | 2), src_lane);
+      comps[i] = nir_bcsel(b, pick_hi, hi, lo);
+   }
+   return nir_vec(b, comps, 8);
+}
+
 static nir_def *
 lower_cmat_muladd(nir_builder *b, nir_intrinsic_instr *intr, nir_def *cmat_a,
                   nir_def *cmat_b, nir_def *cmat_c,
@@ -503,16 +533,20 @@ lower_cmat_muladd(nir_builder *b, nir_intrinsic_instr *intr, nir_def *cmat_a,
          .a_type = GLSL_TYPE_FLOAT16,
          .b_type = GLSL_TYPE_FLOAT16,
       };
+      /* f16 C and D: HMMA.884.F16.F16 (two STEPs per k-chunk).  Otherwise
+       * accumulate in f32 and move between the layouts as needed.
+       */
+      const bool d_f16 = glsl_base_type_bit_size(d_desc.element_type) == 16;
       nir_def *acc = cmat_c;
-      if (acc->bit_size != 32)
-         acc = nir_f2f32(b, acc);
+      if (acc->bit_size == 16 && !d_f16)
+         acc = volta_acc_relayout(b, nir_f2f32(b, acc));
       for (unsigned kc = 0; kc < 4; kc++) {
          acc = nir_cmat_muladd_nv(b, 8, nir_channels(b, cmat_a, 0xfu << (4 * kc)),
                                   nir_channels(b, cmat_b, 0xfu << (4 * kc)), acc,
                                   .flags = NAK_AS_U32(vflags));
       }
-      if (glsl_base_type_bit_size(d_desc.element_type) != 32)
-         acc = nir_f2f16(b, acc);
+      if (d_f16 && acc->bit_size == 32)
+         acc = nir_f2f16(b, volta_acc_relayout(b, acc));
       return acc;
    }
 
@@ -629,6 +663,16 @@ lower_cmat_convert(nir_builder *b, nir_intrinsic_instr *intr, nir_def *cmat,
    assert(!cmat_volta_float(a_desc, sm) || a_desc.use == d_desc.use);
    /* float and integer matrices have different layouts on Volta */
    assert(cmat_volta_float(a_desc, sm) == cmat_volta_float(d_desc, sm));
+
+   if (cmat_volta_float(a_desc, sm) &&
+       a_desc.use == GLSL_CMAT_USE_ACCUMULATOR &&
+       glsl_base_type_bit_size(a_desc.element_type) !=
+       glsl_base_type_bit_size(d_desc.element_type)) {
+      /* f16 and f32 accumulators have different layouts on Volta */
+      if (glsl_base_type_bit_size(d_desc.element_type) == 16)
+         return nir_f2f16(b, volta_acc_relayout(b, cmat));
+      return volta_acc_relayout(b, nir_f2f32(b, cmat));
+   }
 
    nir_cmat_signed cmat_signed_mask = nir_intrinsic_cmat_signed_mask(intr);
 
