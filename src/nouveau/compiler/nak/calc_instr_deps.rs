@@ -257,32 +257,63 @@ impl DepGraph {
     }
 }
 
+/// Scoreboards count outstanding instructions, so several instructions can
+/// share one and a wait on it waits for all of them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BarShare {
+    /// Matrix multiply (HMMA/IMMA) reads or writes.  ptxas puts a whole
+    /// HMMA stream on one scoreboard.
+    Mma { read: bool },
+    /// Memory loads.  With one scoreboard each, a seventh outstanding load
+    /// has to wait for the oldest one; ptxas puts a dozen loads on one.
+    Load { read: bool },
+}
+
 struct BarAlloc {
     num_bars: u8,
-    bar_dep: [usize; 6],
+    bar_deps: [Vec<usize>; 6],
+    bar_share: [Option<BarShare>; 6],
 }
 
 impl BarAlloc {
     pub fn new() -> BarAlloc {
         BarAlloc {
             num_bars: 6,
-            bar_dep: [usize::MAX; 6],
+            bar_deps: Default::default(),
+            bar_share: [None; 6],
         }
     }
 
     pub fn bar_is_free(&self, bar: u8) -> bool {
         debug_assert!(bar < self.num_bars);
-        self.bar_dep[usize::from(bar)] == usize::MAX
+        self.bar_deps[usize::from(bar)].is_empty()
     }
 
-    pub fn set_bar_dep(&mut self, bar: u8, dep: usize) {
+    pub fn set_bar_dep(
+        &mut self,
+        bar: u8,
+        dep: usize,
+        share: Option<BarShare>,
+    ) {
         debug_assert!(self.bar_is_free(bar));
-        self.bar_dep[usize::from(bar)] = dep;
+        self.bar_deps[usize::from(bar)].push(dep);
+        self.bar_share[usize::from(bar)] = share;
+    }
+
+    /// Adds dep to a scoreboard already shared by the same kind of
+    /// instruction, if there is one.
+    pub fn try_share_bar(&mut self, dep: usize, share: BarShare) -> Option<u8> {
+        let bar = (0..self.num_bars)
+            .filter(|&b| self.bar_share[usize::from(b)] == Some(share))
+            .max_by_key(|&b| self.bar_deps[usize::from(b)].last().copied())?;
+        self.bar_deps[usize::from(bar)].push(dep);
+        Some(bar)
     }
 
     pub fn free_bar(&mut self, bar: u8) {
         debug_assert!(!self.bar_is_free(bar));
-        self.bar_dep[usize::from(bar)] = usize::MAX;
+        self.bar_deps[usize::from(bar)].clear();
+        self.bar_share[usize::from(bar)] = None;
     }
 
     pub fn try_find_free_bar(&self) -> Option<u8> {
@@ -293,7 +324,9 @@ impl BarAlloc {
         // Get the oldest by looking for the one with the smallest dep
         let mut bar = 0;
         for b in 1..self.num_bars {
-            if self.bar_dep[usize::from(b)] < self.bar_dep[usize::from(bar)] {
+            if self.bar_deps[usize::from(b)][0]
+                < self.bar_deps[usize::from(bar)][0]
+            {
                 bar = b;
             }
         }
@@ -302,7 +335,8 @@ impl BarAlloc {
     }
 
     pub fn get_bar_for_dep(&self, dep: usize) -> Option<u8> {
-        (0..self.num_bars).find(|&bar| self.bar_dep[usize::from(bar)] == dep)
+        (0..self.num_bars)
+            .find(|&bar| self.bar_deps[usize::from(bar)].contains(&dep))
     }
 }
 
@@ -721,24 +755,38 @@ fn assign_barriers(f: &mut Function, sm: &ShaderModelInfo) {
                 continue;
             }
 
+            let is_mma = matches!(instr.op, Op::Hmma(_) | Op::Imma(_));
+            let is_load = matches!(instr.op, Op::Ld(_));
             let (rd_dep, wr_dep) = deps.get_instr_deps(bi, ip);
-            if deps.dep_is_waited_after(rd_dep, bi, ip) {
-                let rd_bar = bars.try_find_free_bar().unwrap_or_else(|| {
+            for (dep, read) in [(rd_dep, true), (wr_dep, false)] {
+                if !deps.dep_is_waited_after(dep, bi, ip) {
+                    continue;
+                }
+                let share = if is_mma {
+                    Some(BarShare::Mma { read })
+                } else if is_load {
+                    Some(BarShare::Load { read })
+                } else {
+                    None
+                };
+                let bar = if let Some(bar) = bars.try_find_free_bar() {
+                    bars.set_bar_dep(bar, dep, share);
+                    bar
+                } else if let Some(bar) =
+                    share.and_then(|s| bars.try_share_bar(dep, s))
+                {
+                    bar
+                } else {
                     let bar = bars.free_some_bar();
                     instr.deps.add_wt_bar(bar);
+                    bars.set_bar_dep(bar, dep, share);
                     bar
-                });
-                bars.set_bar_dep(rd_bar, rd_dep);
-                instr.deps.set_rd_bar(rd_bar);
-            }
-            if deps.dep_is_waited_after(wr_dep, bi, ip) {
-                let wr_bar = bars.try_find_free_bar().unwrap_or_else(|| {
-                    let bar = bars.free_some_bar();
-                    instr.deps.add_wt_bar(bar);
-                    bar
-                });
-                bars.set_bar_dep(wr_bar, wr_dep);
-                instr.deps.set_wr_bar(wr_bar);
+                };
+                if read {
+                    instr.deps.set_rd_bar(bar);
+                } else {
+                    instr.deps.set_wr_bar(bar);
+                }
             }
         }
     }
