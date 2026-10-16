@@ -1990,6 +1990,22 @@ nvk_GetPhysicalDeviceCooperativeMatrixPropertiesKHR(VkPhysicalDevice physicalDev
                .scope = VK_SCOPE_SUBGROUP_KHR
             };
          }
+         /* HMMA.884.F16: half the steps and registers of the f32 form */
+         vk_outarray_append_typed(VkCooperativeMatrixPropertiesKHR, &out, p)
+         {
+            *p = (struct VkCooperativeMatrixPropertiesKHR){
+               .sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR,
+               .MSize = 16,
+               .NSize = 16,
+               .KSize = 16,
+               .AType = VK_COMPONENT_TYPE_FLOAT16_KHR,
+               .BType = VK_COMPONENT_TYPE_FLOAT16_KHR,
+               .CType = VK_COMPONENT_TYPE_FLOAT16_KHR,
+               .ResultType = VK_COMPONENT_TYPE_FLOAT16_KHR,
+               .saturatingAccumulation = false,
+               .scope = VK_SCOPE_SUBGROUP_KHR
+            };
+         }
       }
    }
 
