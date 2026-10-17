@@ -540,6 +540,9 @@ fn nak_compile_shader_internal(
     s.remove_annotations();
 
     pass!(s, opt_instr_sched_postpass);
+    if nak.sm < 75 {
+        pass!(s, lower_hmma_steps);
+    }
     pass!(s, calc_instr_deps);
 
     s.gather_info();

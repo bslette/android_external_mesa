@@ -254,3 +254,56 @@ impl Shader<'_> {
         }
     }
 }
+
+
+
+impl Shader<'_> {
+    /// Split each Volta f16-accumulate HMMA.884 pair (HMMA_STEPS_F16_PAIR)
+    /// into STEP0 and STEP1, back to back.  Runs after scheduling and
+    /// register allocation: with the steps separate, the scheduler
+    /// interleaves other HMMAs between them and the register allocator
+    /// moves accumulator halves around between them, and the results are
+    /// wrong unless every HMMA is followed by 7+ cycles.
+    pub fn lower_hmma_steps(&mut self) {
+        for f in &mut self.functions {
+            f.map_instrs(|instr, _| {
+                let Op::Hmma(h) = &instr.op else {
+                    return [instr].into();
+                };
+                if h.step != HMMA_STEPS_F16_PAIR {
+                    return [instr].into();
+                }
+                let Dst::Reg(d) = h.dst else {
+                    panic!("HMMA pair dst must be a register after RA");
+                };
+                let SrcRef::Reg(c) = h.srcs[2].src_ref else {
+                    panic!("HMMA pair C must be a register after RA");
+                };
+                assert!(d.comps() == 4 && c.comps() == 4);
+                let mut out = Vec::new();
+                for s in 0..2_u8 {
+                    let half = |r: RegRef| {
+                        RegRef::new(r.file(), r.base_idx() + 2 * u32::from(s), 2)
+                    };
+                    let mut step = Instr::new(OpHmma {
+                        dst: half(d).into(),
+                        dst_type: h.dst_type,
+                        src_type: h.src_type,
+                        mat_size: h.mat_size,
+                        step: s,
+                        srcs: [
+                            h.srcs[0].clone(),
+                            h.srcs[1].clone(),
+                            half(c).into(),
+                        ],
+                    });
+                    step.pred = instr.pred;
+                    out.push(step);
+                }
+                let s1 = out.pop().unwrap();
+                let s0 = out.pop().unwrap();
+                [s0, s1].into()
+            });
+        }
+    }
+}
