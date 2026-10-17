@@ -28,6 +28,15 @@ impl ShaderModel70 {
             Dst::Reg(reg) => reg.file(),
         };
 
+        // Volta HMMA/IMMA results arrive about 24 cycles after issue
+        // (measured: a chain of dependent f16 HMMA.884 pairs runs at 24.3
+        // cycles per link).  They are scoreboarded, so this only steers the
+        // schedulers: with the default 6 they issue the four dependent k
+        // steps of each 16x16x16 multiply back to back and every one waits.
+        if self.sm < 75 && matches!(op, Op::Hmma(_) | Op::Imma(_)) {
+            return 24;
+        }
+
         let (gpr_latency, pred_latency) = if self.sm < 80 {
             match op {
                 // Double-precision float ALU
