@@ -207,6 +207,18 @@ impl ShaderModel for ShaderModel70 {
                     2
                 }
             }
+            // Volta: ptxas never puts fewer than 5 stall cycles after BRA,
+            // BSYNC, EXIT, CALL, RET or BAR, nor fewer than 4 after WARPSYNC
+            // (~150k instances in llama.cpp's CUDA sm_72 build).  With 1,
+            // one warp of llama.cpp's mat-vec occasionally never finishes
+            // (job timeout; 6/30 runs of the k=129 permuted MUL_MAT cases,
+            // 0/60 with these stalls).
+            Op::Bra(_) | Op::BSync(_) | Op::Exit(_) | Op::Kill(_)
+                if self.sm < 75 =>
+            {
+                5
+            }
+            Op::WarpSync(_) if self.sm < 75 => 4,
             // Op::DepBar(_) => 4,
             _ => 1, // TODO: co-issue
         }
