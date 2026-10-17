@@ -3554,6 +3554,12 @@ impl fmt::Display for HmmaSize {
     }
 }
 
+/// OpHmma::step value for a Volta M8N8K4 operation with an f16 accumulator
+/// whose STEP0 and STEP1 are still one instruction (four result registers).
+/// lower_hmma_steps() splits it after scheduling and register allocation so
+/// the two steps are always issued back to back, as the hardware needs.
+pub const HMMA_STEPS_F16_PAIR: u8 = 0xff;
+
 #[repr(C)]
 #[derive(SrcsAsSlice, DstsAsSlice)]
 pub struct OpHmma {

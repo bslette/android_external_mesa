@@ -4119,6 +4119,20 @@ impl<'a> ShaderFromNir<'a> {
                             _ => unreachable!("unsupported HMMA.884 type"),
                         };
                         assert_eq!(c.len(), usize::from(steps) * 2);
+                        if dst_type == FloatType::F16 {
+                            b.push_op(OpHmma {
+                                dst: dst.clone().into(),
+                                dst_type,
+                                src_type: FloatType::F16,
+                                mat_size: HmmaSize::M8N8K4,
+                                step: HMMA_STEPS_F16_PAIR,
+                                srcs: [
+                                    cmat_a.clone(),
+                                    cmat_b.clone(),
+                                    SSARef::try_from(&c[..]).unwrap().into(),
+                                ],
+                            });
+                        } else {
                         for step in 0..steps {
                             let s = usize::from(step) * 2;
                             let c_pair = SSARef::try_from(&c[s..s + 2]).unwrap();
@@ -4135,6 +4149,7 @@ impl<'a> ShaderFromNir<'a> {
                                     c_pair.into(),
                                 ],
                             });
+                        }
                         }
                     }
                     NAK_CMAT_TYPE_M8N8K16_INT

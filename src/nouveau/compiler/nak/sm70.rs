@@ -189,16 +189,15 @@ impl ShaderModel for ShaderModel70 {
             // what was validated here; the Nop that calc_instr_deps adds after
             // every HMMA is needed (without it llama.cpp's f32-accumulate
             // matmul miscomputes even with 4/6), reason unknown.
-            // HMMA.884.F16 (f16 accumulator).  ptxas puts 4 cycles between
-            // steps, but here llama.cpp's f16-accumulate matmuls (q2_0,
-            // nvfp4, iq2_xxs) give wrong results with 4..6 and pass with 7
-            // or more (measured; the Nop that calc_instr_deps adds comes on
-            // top).  10 for margin.
+            // HMMA.884.F16 (f16 accumulator): ptxas issues STEP0 and STEP1
+            // of each HMMA back to back and puts 4 cycles between HMMAs.
+            // The steps must stay adjacent (see HMMA_STEPS_F16_PAIR); then
+            // 2 plus the Nop that calc_instr_deps adds gives ptxas' 4.
             Op::Hmma(h)
                 if h.mat_size == HmmaSize::M8N8K4
                     && h.dst_type == FloatType::F16 =>
             {
-                10
+                2
             }
             Op::Hmma(h) if h.mat_size == HmmaSize::M8N8K4 => {
                 if h.step == 3 {
