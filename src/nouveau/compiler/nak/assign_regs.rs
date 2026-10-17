@@ -166,6 +166,11 @@ impl SSAUseMap {
 struct PhiWebs {
     uf: UnionFind<SSAValue, FxBuildHasher>,
     assignments: FxHashMap<SSAValue, u32>,
+    /// First use of each SSA value as a component of a vector source,
+    /// anywhere in the function.  SSAUseMap only sees the current block, so
+    /// a loop-header phi would otherwise not know that the loop body uses it
+    /// as part of an aligned vector (e.g. an HMMA accumulator).
+    vec_uses: FxHashMap<SSAValue, SSARef>,
 }
 
 impl PhiWebs {
@@ -205,15 +210,37 @@ impl PhiWebs {
             }
         }
 
+        let mut vec_uses: FxHashMap<SSAValue, SSARef> = Default::default();
+        for b in f.blocks.iter() {
+            for instr in &b.instrs {
+                for src in instr.srcs() {
+                    if let Some(vec) = src_ssa_ref(src) {
+                        if vec.len() > 1 {
+                            for ssa in vec.iter() {
+                                vec_uses
+                                    .entry(*ssa)
+                                    .or_insert_with(|| SSARef::new(vec));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         PhiWebs {
             uf,
             assignments: Default::default(),
+            vec_uses,
         }
     }
 
     pub fn get(&mut self, ssa: SSAValue) -> Option<u32> {
         let phi_web_id = self.uf.find(ssa);
         self.assignments.get(&phi_web_id).copied()
+    }
+
+    pub fn vec_use(&self, ssa: SSAValue) -> Option<SSARef> {
+        self.vec_uses.get(&ssa).cloned()
     }
 
     pub fn set(&mut self, ssa: SSAValue, reg: u32) {
@@ -409,16 +436,39 @@ impl RegAllocator {
         phi_webs: &mut PhiWebs,
         ssa: SSAValue,
     ) -> u32 {
-        // Bias register assignment using the phi coalescing
+        // Bias register assignment using the phi coalescing, unless the
+        // value is next used as a component of a vector and the hinted
+        // register can't be that component of an aligned group.  A loop
+        // phi of an HMMA accumulator otherwise inherits the misaligned
+        // registers of its initial value, and every HMMA in the loop then
+        // copies the accumulator to an aligned temporary and back.
         if let Some(reg) = phi_webs.get(ssa) {
-            if !self.reg_is_used(reg) {
+            let vec = match sum.find_vec_use_after(ssa, ip) {
+                Some(SSAUse::Vec(vec)) => Some(vec.clone()),
+                Some(_) => None,
+                None => phi_webs.vec_use(ssa),
+            };
+            let aligned = match vec {
+                Some(vec) => {
+                    let align = u32::from(vec.comps().next_power_of_two());
+                    let comp = (0..vec.comps())
+                        .find(|&c| vec[usize::from(c)] == ssa)
+                        .unwrap();
+                    reg % align == u32::from(comp)
+                }
+                None => true,
+            };
+            if aligned && !self.reg_is_used(reg) {
                 self.assign_reg(ssa, reg);
                 return reg;
             }
         }
 
-        // Otherwise, use SSAUseMap heuristics
-        if let Some(u) = sum.find_vec_use_after(ssa, ip) {
+        // Otherwise, use SSAUseMap heuristics, falling back to the first
+        // vector use anywhere in the function
+        let global_vec = phi_webs.vec_use(ssa).map(SSAUse::Vec);
+        let u = sum.find_vec_use_after(ssa, ip).or(global_vec.as_ref());
+        if let Some(u) = u {
             match u {
                 SSAUse::FixedReg(reg) => {
                     if !self.reg_is_used(*reg) {
@@ -466,6 +516,18 @@ impl RegAllocator {
                         self.try_find_unused_reg_range(0, vec.comps(), align, 0)
                     {
                         let reg = base_reg + u32::from(comp);
+                        self.assign_reg(ssa, reg);
+                        return reg;
+                    }
+
+                    // Failing that, at least put this component at its
+                    // offset within an aligned group, so the others can still
+                    // be placed next to it.  Otherwise a loop-carried vector
+                    // (e.g. an HMMA accumulator) can end up misaligned and
+                    // gets copied into an aligned temporary at every use.
+                    if let Some(reg) =
+                        self.try_find_unused_reg_range(0, 1, align, comp)
+                    {
                         self.assign_reg(ssa, reg);
                         return reg;
                     }
