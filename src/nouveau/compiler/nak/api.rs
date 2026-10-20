@@ -28,6 +28,7 @@ enum DebugFlags {
     Annotate,
     NoUgpr,
     Cycles,
+    NoWrap,
 }
 
 pub struct Debug {
@@ -54,6 +55,7 @@ impl Debug {
                 "annotate" => flags |= 1 << DebugFlags::Annotate as u8,
                 "nougpr" => flags |= 1 << DebugFlags::NoUgpr as u8,
                 "cycles" => flags |= 1 << DebugFlags::Cycles as u8,
+                "nowrap" => flags |= 1 << DebugFlags::NoWrap as u8,
                 unk => eprintln!("Unknown NAK_DEBUG flag \"{}\"", unk),
             }
         }
@@ -91,6 +93,10 @@ pub trait GetDebugFlags {
     fn cycles(&self) -> bool {
         self.debug_flags() & (1 << DebugFlags::Cycles as u8) != 0
     }
+
+    fn no_wrap(&self) -> bool {
+        self.debug_flags() & (1 << DebugFlags::NoWrap as u8) != 0
+    }
 }
 
 pub static DEBUG: OnceLock<Debug> = OnceLock::new();
@@ -109,6 +115,11 @@ pub extern "C" fn nak_should_print_nir() -> bool {
 #[no_mangle]
 pub extern "C" fn nak_debug_no_ugpr() -> bool {
     DEBUG.no_ugpr()
+}
+
+#[no_mangle]
+pub extern "C" fn nak_debug_no_wrap() -> bool {
+    DEBUG.no_wrap()
 }
 
 fn nir_options(dev: &nv_device_info) -> nir_shader_compiler_options {

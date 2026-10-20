@@ -1469,6 +1469,91 @@ nak_nir_opt_offset_shift_nv(nir_shader *nir, const struct nak_compiler *nak)
    );
 }
 
+
+/* NAK_DEBUG=nowrap: assume 32-bit buffer offsets never wrap and pull
+ * constants out of u2u64(iadd(x, #c)) in global addresses so that
+ * nir_opt_offsets can fold them into the LDG/STG immediate. This is not
+ * valid in general: a shader may compute an offset that wraps on purpose.
+ */
+
+/* Returns s with every constant term of its iadd tree removed (their sum is
+ * added to *c), or NULL if the tree has no constant terms.
+ */
+static nir_def *
+nak_strip_iadd_consts(nir_builder *b, nir_scalar s, uint64_t *c, unsigned depth)
+{
+   s = nir_scalar_chase_movs(s);
+   if (depth > 6 || !nir_scalar_is_alu(s) || nir_scalar_alu_op(s) != nir_op_iadd)
+      return NULL;
+
+   nir_scalar src[2] = {
+      nir_scalar_chase_movs(nir_scalar_chase_alu_src(s, 0)),
+      nir_scalar_chase_movs(nir_scalar_chase_alu_src(s, 1)),
+   };
+   for (unsigned i = 0; i < 2; i++) {
+      if (nir_scalar_is_const(src[i])) {
+         *c += nir_scalar_as_uint(src[i]);
+         nir_def *rest = nak_strip_iadd_consts(b, src[1 - i], c, depth + 1);
+         return rest ? rest : nir_mov_scalar(b, src[1 - i]);
+      }
+   }
+
+   nir_def *n0 = nak_strip_iadd_consts(b, src[0], c, depth + 1);
+   nir_def *n1 = nak_strip_iadd_consts(b, src[1], c, depth + 1);
+   if (!n0 && !n1)
+      return NULL;
+   return nir_iadd(b, n0 ? n0 : nir_mov_scalar(b, src[0]),
+                      n1 ? n1 : nir_mov_scalar(b, src[1]));
+}
+
+static bool
+nak_nir_nowrap_addr_fold_impl(nir_builder *b, nir_intrinsic_instr *intr,
+                              void *data)
+{
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_global_nv:
+   case nir_intrinsic_store_global_nv:
+      break;
+   default:
+      return false;
+   }
+
+   nir_src *src = nir_get_io_offset_src(intr);
+   if (src->ssa->bit_size != 64 || src->ssa->num_components != 1)
+      return false;
+
+   nir_scalar addr = nir_scalar_chase_movs(nir_get_scalar(src->ssa, 0));
+   if (!nir_scalar_is_alu(addr) || nir_scalar_alu_op(addr) != nir_op_iadd)
+      return false;
+
+   for (unsigned i = 0; i < 2; i++) {
+      nir_scalar conv = nir_scalar_chase_movs(nir_scalar_chase_alu_src(addr, i));
+      if (!nir_scalar_is_alu(conv) || nir_scalar_alu_op(conv) != nir_op_u2u64)
+         continue;
+
+      nir_scalar off = nir_scalar_chase_movs(nir_scalar_chase_alu_src(conv, 0));
+      uint64_t c = 0;
+      b->cursor = nir_before_instr(&intr->instr);
+      nir_def *stripped = nak_strip_iadd_consts(b, off, &c, 0);
+      if (!stripped || c == 0 || c >= (1u << 23))
+         return false;
+
+      nir_scalar other = nir_scalar_chase_alu_src(addr, 1 - i);
+      nir_def *base = nir_iadd(b, nir_mov_scalar(b, other),
+                                  nir_u2u64(b, stripped));
+      nir_src_rewrite(src, nir_iadd_imm(b, base, c));
+      return true;
+   }
+   return false;
+}
+
+static bool
+nak_nir_nowrap_addr_fold(nir_shader *nir)
+{
+   return nir_shader_intrinsics_pass(nir, nak_nir_nowrap_addr_fold_impl,
+                                     nir_metadata_control_flow, NULL);
+}
+
 static uint32_t
 nak_nir_max_imm_offset(nir_intrinsic_instr *intrin, const void *data)
 {
@@ -1745,6 +1830,11 @@ nak_postprocess_nir(nir_shader *nir,
 
    if (OPT(nir, nak_nir_lower_load_store, nak))
       OPT(nir, nir_opt_constant_folding);
+
+   if (nak_debug_no_wrap()) {
+      OPT(nir, nak_nir_nowrap_addr_fold);
+      OPT(nir, nir_opt_cse);
+   }
 
    struct nir_opt_offsets_options nak_offset_options = {
       .max_offset_cb = nak_nir_max_imm_offset,
