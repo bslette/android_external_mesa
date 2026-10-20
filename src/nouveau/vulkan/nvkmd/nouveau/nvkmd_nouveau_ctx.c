@@ -12,6 +12,9 @@
 #include "vk_log.h"
 
 #include <xf86drm.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 static ALWAYS_INLINE VkResult
 nvkmd_nouveau_ctx_add_sync(struct nvkmd_ctx *ctx,
@@ -35,6 +38,81 @@ nvkmd_nouveau_ctx_add_sync(struct nvkmd_ctx *ctx,
                             DRM_NOUVEAU_SYNC_SYNCOBJ,
       .handle = syncobj->syncobj,
       .timeline_value = sync_value,
+   };
+
+   return VK_SUCCESS;
+}
+
+
+/* nouveau maps VM_BIND system memory volatile (L2-uncached) unless its
+ * uvmm_sysmem_vol parameter is 0.  On a Tegra iGPU all memory is system
+ * memory, so with volatile mappings the L2 caches nothing.  When the L2 does
+ * cache system memory, the CPU cannot see into it: flush dirty lines and
+ * drop stale system memory lines before every exec, and flush dirty lines
+ * after it, before its fences signal.
+ */
+static bool
+nvkmd_nouveau_l2_maint_needed(void)
+{
+   const char *env = getenv("NVK_L2_SYSMEM_MAINT");
+   if (env != NULL)
+      return atoi(env) != 0;
+
+   FILE *f = fopen("/sys/module/nouveau/parameters/uvmm_sysmem_vol", "r");
+   if (f == NULL)
+      return false;
+   int vol = 1;
+   if (fscanf(f, "%d", &vol) != 1)
+      vol = 1;
+   fclose(f);
+   return vol == 0;
+}
+
+#define HOST_INC(mthd, count) ((1u << 29) | ((count) << 16) | ((mthd) >> 2))
+#define HOST_IMMD(mthd, data) ((4u << 29) | ((data) << 16) | ((mthd) >> 2))
+#define HOST_MEM_OP_A 0x0028
+#define HOST_WFI      0x0078
+#define MEM_OP_L2_SYSMEM_INVALIDATE 0x0e
+#define MEM_OP_L2_FLUSH_DIRTY       0x10
+
+static uint32_t
+nvkmd_nouveau_push_mem_op(uint32_t *p, uint32_t op)
+{
+   p[0] = HOST_INC(HOST_MEM_OP_A, 4);
+   p[1] = 0;
+   p[2] = 0;
+   p[3] = 0;
+   p[4] = op << 27;
+   return 5;
+}
+
+static VkResult
+nvkmd_nouveau_exec_ctx_init_l2_maint(struct nvkmd_nouveau_exec_ctx *ctx,
+                                     struct nvkmd_dev *dev,
+                                     struct vk_object_base *log_obj)
+{
+   VkResult result = nvkmd_dev_alloc_mapped_mem(dev, log_obj, 4096, 0,
+                                                NVKMD_MEM_GART,
+                                                NVKMD_MEM_MAP_WR,
+                                                &ctx->l2_maint_mem);
+   if (result != VK_SUCCESS)
+      return result;
+
+   uint32_t *map = ctx->l2_maint_mem->map;
+   const uint64_t va = ctx->l2_maint_mem->va->addr;
+
+   uint32_t n = 0;
+   n += nvkmd_nouveau_push_mem_op(map + n, MEM_OP_L2_FLUSH_DIRTY);
+   n += nvkmd_nouveau_push_mem_op(map + n, MEM_OP_L2_SYSMEM_INVALIDATE);
+   ctx->l2_pre = (struct drm_nouveau_exec_push) {
+      .va = va, .va_len = n * 4,
+   };
+
+   const uint32_t post = n;
+   map[n++] = HOST_IMMD(HOST_WFI, 1 /* SCOPE_ALL */);
+   n += nvkmd_nouveau_push_mem_op(map + n, MEM_OP_L2_FLUSH_DIRTY);
+   ctx->l2_post = (struct drm_nouveau_exec_push) {
+      .va = va + post * 4, .va_len = (n - post) * 4,
    };
 
    return VK_SUCCESS;
@@ -82,6 +160,19 @@ nvkmd_nouveau_create_exec_ctx(struct nvkmd_dev *_dev,
    ctx->max_push = dev->ws_dev->max_push;
    ctx->req_push = UTIL_DYNARRAY_INIT;
 
+   if (nvkmd_nouveau_l2_maint_needed()) {
+      VkResult result =
+         nvkmd_nouveau_exec_ctx_init_l2_maint(ctx, &dev->base, log_obj);
+      if (result != VK_SUCCESS) {
+         drmSyncobjDestroy(dev->ws_dev->fd, ctx->syncobj);
+         nouveau_ws_context_destroy(ctx->ws_ctx);
+         FREE(ctx);
+         return result;
+      }
+      /* Leave room for the pre and post pushes */
+      ctx->max_push -= 2;
+   }
+
    ctx->req = (struct drm_nouveau_exec) {
       .channel = ctx->ws_ctx->channel,
       .push_count = 0,
@@ -103,6 +194,9 @@ nvkmd_nouveau_exec_ctx_destroy(struct nvkmd_ctx *_ctx)
    struct nvkmd_nouveau_exec_ctx *ctx = nvkmd_nouveau_exec_ctx(_ctx);
 
    util_dynarray_fini(&ctx->req_push);
+
+   if (ctx->l2_maint_mem != NULL)
+      nvkmd_mem_unref(ctx->l2_maint_mem);
 
    ASSERTED int err = drmSyncobjDestroy(ctx->ws_dev->fd, ctx->syncobj);
    assert(err == 0);
@@ -142,6 +236,19 @@ nvkmd_nouveau_exec_ctx_flush(struct nvkmd_ctx *_ctx,
        ctx->req.wait_count == 0 &&
        ctx->req.sig_count == 0)
       return VK_SUCCESS;
+
+   if (ctx->l2_maint_mem != NULL && ctx->req.push_count > 0) {
+      struct drm_nouveau_exec_push *pre =
+         util_dynarray_grow(&ctx->req_push, struct drm_nouveau_exec_push, 2);
+      if (pre == NULL)
+         return vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
+      struct drm_nouveau_exec_push *pushes = util_dynarray_begin(&ctx->req_push);
+      memmove(pushes + 1, pushes,
+              ctx->req.push_count * sizeof(struct drm_nouveau_exec_push));
+      pushes[0] = ctx->l2_pre;
+      pushes[ctx->req.push_count + 1] = ctx->l2_post;
+      ctx->req.push_count += 2;
+   }
 
    ctx->req.push_ptr = (uintptr_t)util_dynarray_begin(&ctx->req_push);
    int err = drmCommandWriteRead(ctx->ws_dev->fd, DRM_NOUVEAU_EXEC,

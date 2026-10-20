@@ -111,6 +111,9 @@ struct nvkmd_nouveau_exec_ctx {
 
    struct drm_nouveau_exec req;
    struct drm_nouveau_sync req_wait[NVKMD_NOUVEAU_MAX_SYNCS];
+   /* With L2-cached system memory: pushes run before and after every exec */
+   struct nvkmd_mem *l2_maint_mem;
+   struct drm_nouveau_exec_push l2_pre, l2_post;
    struct drm_nouveau_sync req_sig[NVKMD_NOUVEAU_MAX_SYNCS];
    struct util_dynarray req_push;
 };
