@@ -171,6 +171,12 @@ pub fn side_effect_type(op: &Op) -> SideEffect {
 
         // Memory ops
         Op::Ipa(_) | Op::Ldc(_) => SideEffect::None,
+        // Nothing writes memory read with a constant load while the shader
+        // runs, so these only need their data dependencies. Keeping them out
+        // of the memory chain lets later loads issue ahead of them.
+        Op::Ld(ld) if ld.access.order == MemOrder::Constant => {
+            SideEffect::None
+        }
         Op::Ld(_)
         | Op::Ldsm(_)
         | Op::LdSharedLock(_)
@@ -300,6 +306,10 @@ pub fn estimate_variable_latency(sm: &ShaderModelInfo, op: &Op) -> u32 {
 
         // Memory ops
         Op::Ldc(_) => 4,
+
+        // Global loads mostly miss L1. Scheduling them like an L2/DRAM access
+        // gets independent loads issued early instead of next to their uses.
+        Op::Ld(ld) if matches!(ld.access.space, MemSpace::Global(_)) => 200,
 
         Op::Ld(_)
         | Op::Ldsm(_)
