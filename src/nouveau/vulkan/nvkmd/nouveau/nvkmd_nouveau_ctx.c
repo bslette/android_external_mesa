@@ -11,6 +11,8 @@
 #include "vk_drm_syncobj.h"
 #include "vk_log.h"
 
+#include "util/os_misc.h"
+
 #include <xf86drm.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -54,7 +56,7 @@ nvkmd_nouveau_ctx_add_sync(struct nvkmd_ctx *ctx,
 static bool
 nvkmd_nouveau_l2_maint_needed(void)
 {
-   const char *env = getenv("NVK_L2_SYSMEM_MAINT");
+   const char *env = os_get_option("NVK_L2_SYSMEM_MAINT");
    if (env != NULL)
       return atoi(env) != 0;
 
