@@ -3571,6 +3571,10 @@ pub struct OpHmma {
     pub dst_type: FloatType,
     /// STEP of a Volta M8N8K4 operation, 0 otherwise
     pub step: u8,
+    /// Volta M8N8K4: A is a column-major and/or B a row-major fragment
+    /// (mma.m8n8k4 .col A / .row B); the default is row-major A, column-major B
+    pub a_col: bool,
+    pub b_row: bool,
 
     #[src_type(SSA)]
     pub srcs: [Src; 3],
@@ -3580,7 +3584,7 @@ impl DisplayOp for OpHmma {
     fn fmt_op(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "hmma{}{}{} {} {} {}",
+            "hmma{}{}{}{}{} {} {} {}",
             self.mat_size,
             self.dst_type,
             if self.mat_size == HmmaSize::M8N8K4 {
@@ -3588,6 +3592,8 @@ impl DisplayOp for OpHmma {
             } else {
                 String::new()
             },
+            if self.a_col { ".acol" } else { "" },
+            if self.b_row { ".brow" } else { "" },
             self.srcs[0],
             self.srcs[1],
             self.srcs[2],

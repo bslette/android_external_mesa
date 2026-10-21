@@ -291,6 +291,8 @@ impl Shader<'_> {
                         src_type: h.src_type,
                         mat_size: h.mat_size,
                         step: s,
+                        a_col: h.a_col,
+                        b_row: h.b_row,
                         srcs: [
                             h.srcs[0].clone(),
                             h.srcs[1].clone(),

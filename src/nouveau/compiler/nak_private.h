@@ -408,7 +408,10 @@ struct nak_nir_cmat_mul_add_flags {
    enum glsl_base_type a_type:5;
    enum glsl_base_type b_type:5;
    bool sat:1;
-   uint32_t pad:18;
+   /* Volta HMMA.884: A column-major / B row-major fragments */
+   bool volta_a_col:1;
+   bool volta_b_row:1;
+   uint32_t pad:16;
 };
 
 bool nak_nir_lower_fs_inputs(nir_shader *nir,

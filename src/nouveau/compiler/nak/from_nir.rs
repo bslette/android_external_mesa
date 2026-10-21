@@ -4101,6 +4101,8 @@ impl<'a> ShaderFromNir<'a> {
                             src_type: FloatType::F16,
                             mat_size: mat_size,
                             step: 0,
+                            a_col: false,
+                            b_row: false,
                             srcs: [cmat_a, cmat_b, cmat_c],
                         });
                     }
@@ -4126,6 +4128,8 @@ impl<'a> ShaderFromNir<'a> {
                                 src_type: FloatType::F16,
                                 mat_size: HmmaSize::M8N8K4,
                                 step: HMMA_STEPS_F16_PAIR,
+                                a_col: flags.volta_a_col(),
+                                b_row: flags.volta_b_row(),
                                 srcs: [
                                     cmat_a.clone(),
                                     cmat_b.clone(),
@@ -4143,6 +4147,8 @@ impl<'a> ShaderFromNir<'a> {
                                 src_type: FloatType::F16,
                                 mat_size: HmmaSize::M8N8K4,
                                 step,
+                                a_col: flags.volta_a_col(),
+                                b_row: flags.volta_b_row(),
                                 srcs: [
                                     cmat_a.clone(),
                                     cmat_b.clone(),

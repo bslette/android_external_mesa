@@ -4352,10 +4352,11 @@ impl SM70Op for OpHmma {
 
     fn encode(&self, e: &mut SM70Encoder<'_>) {
         if e.sm < 75 {
-            // Volta HMMA.884, as ptxas encodes it for sm_72: A row-major,
-            // B column-major (bit 74), D f32 (bit 76), C f32 (bit 78), STEP
-            // in bits 79..81.  Bit 73 would make A column-major.  With an
-            // f16 accumulator (C and D f16) there are only STEP0 and STEP1.
+            // Volta HMMA.884, as ptxas encodes it for sm_72: A column-major
+            // (bit 73, else row-major), B column-major (bit 74, else
+            // row-major), D f32 (bit 76), C f32 (bit 78), STEP in bits
+            // 79..81.  With an f16 accumulator (C and D f16) there are only
+            // STEP0 and STEP1.
             assert!(self.mat_size == HmmaSize::M8N8K4);
             assert!(self.src_type == FloatType::F16);
             let f32 = match self.dst_type {
@@ -4369,7 +4370,8 @@ impl SM70Op for OpHmma {
             e.set_reg_src(24..32, &self.srcs[0]);
             e.set_reg_src(32..40, &self.srcs[1]);
             e.set_reg_src(64..72, &self.srcs[2]);
-            e.set_bit(74, true);
+            e.set_bit(73, self.a_col);
+            e.set_bit(74, !self.b_row);
             e.set_bit(76, f32);
             e.set_bit(78, f32);
             e.set_field(79..81, self.step);
