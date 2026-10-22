@@ -74,6 +74,12 @@ nv50_memobj_create_from_handle(struct pipe_screen *screen,
                                struct winsys_handle *handle,
                                bool dedicated)
 {
+   if (handle->offset != 0) {
+      debug_printf("%s: attempt to import unsupported winsys offset %d\n",
+                   __func__, handle->offset);
+      return NULL;
+   }
+
    struct nv50_memobj *memobj = CALLOC_STRUCT(nv50_memobj);
 
    memobj->bo = nouveau_screen_bo_from_handle(screen, handle, &memobj->stride);

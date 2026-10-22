@@ -109,12 +109,6 @@ nouveau_screen_bo_from_handle(struct pipe_screen *pscreen,
    struct nouveau_bo *bo = NULL;
    int ret;
 
-   if (whandle->offset != 0) {
-      debug_printf("%s: attempt to import unsupported winsys offset %d\n",
-                   __func__, whandle->offset);
-      return NULL;
-   }
-
    if (whandle->type != WINSYS_HANDLE_TYPE_SHARED &&
        whandle->type != WINSYS_HANDLE_TYPE_FD) {
       debug_printf("%s: attempt to import unsupported handle type %d\n",

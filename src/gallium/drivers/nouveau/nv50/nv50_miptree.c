@@ -192,10 +192,11 @@ nv50_miptree_get_handle(struct pipe_screen *pscreen,
 
    stride = mt->level[0].pitch;
 
-   return nouveau_screen_bo_get_handle(pscreen,
-                                       mt->base.bo,
-                                       stride,
-                                       whandle);
+   if (!nouveau_screen_bo_get_handle(pscreen, mt->base.bo, stride, whandle))
+      return false;
+
+   whandle->offset = mt->base.offset;
+   return true;
 }
 
 static inline bool
@@ -422,7 +423,12 @@ nv50_miptree_from_handle(struct pipe_screen *pscreen,
       return NULL;
    }
    mt->base.domain = mt->base.bo->flags & NOUVEAU_BO_APER;
-   mt->base.address = mt->base.bo->offset;
+   /* A plane of a multi-planar image (e.g. the chroma of NV12 or YV12) starts
+    * at an offset into the buffer: place the miptree there, like a miptree
+    * sub-allocated from a larger bo.
+    */
+   mt->base.offset = whandle->offset;
+   mt->base.address = mt->base.bo->offset + whandle->offset;
 
    mt->base.base = *templ;
    pipe_reference_init(&mt->base.base.reference, 1);

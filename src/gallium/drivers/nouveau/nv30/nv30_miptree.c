@@ -520,6 +520,12 @@ nv30_miptree_from_handle(struct pipe_screen *pscreen,
        tmpl->array_size > 1)
       return NULL;
 
+   if (handle->offset != 0) {
+      debug_printf("%s: attempt to import unsupported winsys offset %d\n",
+                   __func__, handle->offset);
+      return NULL;
+   }
+
    mt = CALLOC_STRUCT(nv30_miptree);
    if (!mt)
       return NULL;
