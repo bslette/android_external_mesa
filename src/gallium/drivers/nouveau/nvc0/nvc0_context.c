@@ -92,6 +92,26 @@ nvc0_flush(struct pipe_context *pipe,
 }
 
 static void
+nvc0_create_fence_fd(struct pipe_context *pipe, struct pipe_fence_handle **pfence,
+                     int fd, enum pipe_fd_type type)
+{
+   struct nouveau_fence *fence = NULL;
+
+   assert(type == PIPE_FD_TYPE_NATIVE_SYNC);
+   *pfence = NULL;
+   if (nouveau_fence_new_from_fd(&nvc0_context(pipe)->base, fd, &fence))
+      *pfence = (struct pipe_fence_handle *)fence;
+}
+
+/* The engine cannot wait on a sync_file: wait for it on the CPU. */
+static void
+nvc0_fence_server_sync(struct pipe_context *pipe, struct pipe_fence_handle *pfence,
+                       uint64_t value)
+{
+   nouveau_fence_wait(nouveau_fence(pfence), NULL);
+}
+
+static void
 nvc0_texture_barrier(struct pipe_context *pipe, unsigned flags)
 {
    struct nouveau_pushbuf *push = nvc0_context(pipe)->base.pushbuf;
@@ -454,6 +474,8 @@ nvc0_create(struct pipe_screen *pscreen, void *priv, unsigned ctxflags)
    pipe->svm_migrate = nvc0_svm_migrate;
 
    pipe->flush = nvc0_flush;
+   pipe->create_fence_fd = nvc0_create_fence_fd;
+   pipe->fence_server_sync = nvc0_fence_server_sync;
    pipe->texture_barrier = nvc0_texture_barrier;
    pipe->memory_barrier = nvc0_memory_barrier;
    pipe->get_sample_position = nvc0_context_get_sample_position;

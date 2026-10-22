@@ -265,6 +265,7 @@ nvc0_init_screen_caps(struct nvc0_screen *screen)
    caps->vertex_color_unclamped = true;
    caps->vertex_color_clamped = true;
    caps->query_timestamp = true;
+   caps->native_fence_fd = true;
    caps->query_time_elapsed = true;
    caps->occlusion_query = true;
    caps->stream_output_pause_resume = true;

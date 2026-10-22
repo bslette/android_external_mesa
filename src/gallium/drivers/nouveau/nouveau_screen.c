@@ -99,6 +99,13 @@ nouveau_screen_fence_finish(struct pipe_screen *screen,
    return nouveau_fence_wait(nouveau_fence(pfence), NULL);
 }
 
+static int
+nouveau_screen_fence_get_fd(struct pipe_screen *screen,
+                            struct pipe_fence_handle *pfence)
+{
+   return nouveau_fence_get_fd(nouveau_fence(pfence));
+}
+
 
 struct nouveau_bo *
 nouveau_screen_bo_from_handle(struct pipe_screen *pscreen,
@@ -421,6 +428,7 @@ nouveau_screen_init(struct nouveau_screen *screen, struct nouveau_device *dev)
 
    pscreen->fence_reference = nouveau_screen_fence_ref;
    pscreen->fence_finish = nouveau_screen_fence_finish;
+   pscreen->fence_get_fd = nouveau_screen_fence_get_fd;
 
    pscreen->query_memory_info = nouveau_query_memory_info;
    pscreen->get_driver_uuid = nouveau_driver_uuid;

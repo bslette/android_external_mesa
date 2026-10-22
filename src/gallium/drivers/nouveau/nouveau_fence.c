@@ -25,6 +25,12 @@
 #include "nouveau_winsys.h"
 #include "nouveau_fence.h"
 #include "util/os_time.h"
+#include "util/libsync.h"
+#include "util/os_file.h"
+#include "drm-uapi/dma-buf.h"
+
+#include <sys/ioctl.h>
+#include <unistd.h>
 
 #if DETECT_OS_POSIX
 #include <sched.h>
@@ -49,6 +55,32 @@ nouveau_fence_new(struct nouveau_context *nv, struct nouveau_fence **fence)
    new_fence->screen = nv->screen;
    new_fence->context = nv;
    new_fence->ref = 1;
+   new_fence->fd = -1;
+   list_inithead(&new_fence->work);
+
+   *fence = new_fence;
+   return true;
+}
+
+/* A fence imported from a sync_file: never on the fence list, waited on with
+ * sync_wait().
+ */
+bool
+nouveau_fence_new_from_fd(struct nouveau_context *nv, int fd, struct nouveau_fence **fence)
+{
+   struct nouveau_fence *new_fence = CALLOC_STRUCT(nouveau_fence);
+   if (!new_fence)
+      return false;
+
+   new_fence->fd = os_dupfd_cloexec(fd);
+   if (new_fence->fd < 0) {
+      FREE(new_fence);
+      return false;
+   }
+   new_fence->screen = nv->screen;
+   new_fence->context = nv;
+   new_fence->ref = 1;
+   new_fence->state = NOUVEAU_FENCE_STATE_SIGNALLED;
    list_inithead(&new_fence->work);
 
    *fence = new_fence;
@@ -126,6 +158,8 @@ nouveau_fence_del(struct nouveau_fence *fence)
       nouveau_fence_trigger_work(fence);
    }
 
+   if (fence->fd >= 0)
+      close(fence->fd);
    nouveau_bo_ref(NULL, &fence->bo);
    FREE(fence);
 }
@@ -201,6 +235,9 @@ _nouveau_fence_signalled(struct nouveau_fence *fence)
 
    simple_mtx_assert_locked(&screen->fence.lock);
 
+   if (fence->fd >= 0)
+      return sync_wait(fence->fd, 0) == 0;
+
    if (fence->state == NOUVEAU_FENCE_STATE_SIGNALLED)
       return true;
 
@@ -252,6 +289,9 @@ _nouveau_fence_wait(struct nouveau_fence *fence, struct util_debug_callback *deb
    int64_t start = 0;
 
    simple_mtx_assert_locked(&fence_list->lock);
+
+   if (fence->fd >= 0)
+      return sync_wait(fence->fd, -1) == 0;
 
    if (debug && debug->debug_message)
       start = os_time_get_nano();
@@ -383,6 +423,36 @@ nouveau_fence_next_if_current(struct nouveau_context *nv, struct nouveau_fence *
       result = _nouveau_fence_next(nv);
    simple_mtx_unlock(&fence->screen->fence.lock);
    return result;
+}
+
+/* Every fence has its own bo, which the submission that emits the fence
+ * references read-write, so the kernel attaches that submission's fence to it
+ * as a write fence. Exporting the bo's implicit fence gives a sync_file for
+ * exactly this fence (EGL_ANDROID_native_fence_sync).
+ */
+int
+nouveau_fence_get_fd(struct nouveau_fence *fence)
+{
+   if (fence->fd >= 0)
+      return os_dupfd_cloexec(fence->fd);
+
+   simple_mtx_lock(&fence->screen->fence.lock);
+   bool ok = fence->state == NOUVEAU_FENCE_STATE_SIGNALLED || nouveau_fence_kick(fence);
+   simple_mtx_unlock(&fence->screen->fence.lock);
+   if (!ok || !fence->bo)
+      return -1;
+
+   int dmabuf_fd;
+   if (nouveau_bo_set_prime(fence->bo, &dmabuf_fd))
+      return -1;
+
+   struct dma_buf_export_sync_file export = {
+      .flags = DMA_BUF_SYNC_READ,
+      .fd = -1,
+   };
+   int ret = ioctl(dmabuf_fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &export);
+   close(dmabuf_fd);
+   return ret ? -1 : export.fd;
 }
 
 bool

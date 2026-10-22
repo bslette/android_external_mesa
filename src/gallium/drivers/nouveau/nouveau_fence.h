@@ -30,6 +30,8 @@ struct nouveau_fence {
    uint32_t sequence;
    uint32_t work_count;
    struct list_head work;
+   /* sync_file this fence was imported from (create_fence_fd), or -1 */
+   int fd;
 };
 
 struct nouveau_fence_list {
@@ -70,6 +72,10 @@ void nouveau_fence_update(struct nouveau_screen *, bool flushed);
 MUST_CHECK bool nouveau_fence_next_if_current(struct nouveau_context *, struct nouveau_fence *);
 bool nouveau_fence_wait(struct nouveau_fence *, struct util_debug_callback *);
 bool nouveau_fence_signalled(struct nouveau_fence *);
+/** returns false on error */
+MUST_CHECK bool nouveau_fence_new_from_fd(struct nouveau_context *, int fd, struct nouveau_fence **);
+/** sync_file that signals with the fence, or -1 */
+int nouveau_fence_get_fd(struct nouveau_fence *);
 void nouveau_fence_ref(struct nouveau_fence *, struct nouveau_fence **,
                        struct nouveau_screen *);
 
