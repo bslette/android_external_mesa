@@ -718,6 +718,7 @@ void
 CodeEmitterGV100::emitIMAD()
 {
    emitFormA(0x024, FA_RRR | FA_RRI | FA_RRC | FA_RIR | FA_RCR, __(0), __(1), N_(2));
+   emitPRED (81);
    emitField(73, 1, isSignedType(insn->sType));
 }
 
@@ -1676,6 +1677,7 @@ CodeEmitterGV100::emitPIXLD()
       break;
    }
    emitPRED (71);
+   emitPRED (81);
    emitGPR  (16, insn->def(0));
 }
 
